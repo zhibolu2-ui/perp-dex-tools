@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lighter 价差扫描器</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+
+  :root {
+    --bg-primary: #0a0e17;
+    --bg-secondary: #111827;
+    --bg-card: #1a2234;
+    --bg-hover: #1e2942;
+    --border: #2a3654;
+    --text-primary: #e8edf5;
+    --text-secondary: #8892a8;
+    --text-dim: #5a6580;
+    --green: #00e676;
+    --green-dim: #004d26;
+    --red: #ff5252;
+    --red-dim: #4d1717;
+    --yellow: #ffd740;
+    --cyan: #18ffff;
+    --purple: #b388ff;
+    --accent: #448aff;
+    --gold: #ffab40;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Noto Sans SC', 'JetBrains Mono', sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .header {
+    background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-card) 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .logo {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--cyan);
+    letter-spacing: -0.5px;
+  }
+
+  .logo span { color: var(--text-dim); font-weight: 400; }
+
+  .header-stats {
+    display: flex;
+    gap: 28px;
+    align-items: center;
+  }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+  }
+
+  .stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .stat-value.price { color: var(--gold); }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .ws-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .ws-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+  }
+
+  .ws-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .size-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 12px;
+  }
+
+  .size-control label {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .size-control input {
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    width: 100px;
+    outline: none;
+    text-align: right;
+  }
+
+  .main { padding: 24px 32px; }
+
+  .section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 24px;
+    overflow: hidden;
+  }
+
+  .section-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 0.5px;
+  }
+
+  .section-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-dim);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+  }
+
+  th {
+    text-align: right;
+    padding: 10px 16px;
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-dim);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  th:first-child, td:first-child { text-align: center; width: 40px; }
+  th:nth-child(2), td:nth-child(2) { text-align: center; width: 36px; }
+  th:nth-child(3), td:nth-child(3) { text-align: left; }
+
+  td {
+    padding: 10px 16px;
+    text-align: right;
+    border-bottom: 1px solid rgba(42, 54, 84, 0.4);
+    white-space: nowrap;
+    transition: background 0.2s;
+  }
+
+  tr:hover td { background: var(--bg-hover); }
+
+  .exchange-name {
+    font-family: 'Noto Sans SC', sans-serif;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .dot-connected { color: var(--green); font-size: 16px; }
+  .dot-disconnected { color: var(--red); font-size: 16px; }
+
+  .val-positive { color: var(--green); }
+  .val-negative { color: var(--red); }
+  .val-neutral { color: var(--text-dim); }
+  .val-muted { color: var(--text-dim); }
+  .val-warn { color: var(--yellow); }
+
+  .profit-cell {
+    font-weight: 600;
+    font-size: 14px;
+    padding: 6px 16px;
+  }
+
+  .profit-cell.profit-high {
+    color: var(--green);
+    text-shadow: 0 0 12px rgba(0, 230, 118, 0.3);
+  }
+
+  .direction-cell {
+    font-family: 'Noto Sans SC', sans-serif;
+    font-size: 12px;
+    text-align: left;
+    max-width: 180px;
+  }
+
+  .row-profitable { background: rgba(0, 230, 118, 0.03); }
+  .row-unprofitable { background: transparent; }
+
+  .depth-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 12px;
+    padding: 16px 20px;
+  }
+
+  .depth-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    padding: 6px 0;
+  }
+
+  .depth-name {
+    width: 100px;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .depth-bar-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .depth-bar-track {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-primary);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .depth-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+
+  .depth-bar-fill.lighter { background: linear-gradient(90deg, var(--cyan), var(--accent)); }
+  .depth-bar-fill.exchange { background: linear-gradient(90deg, var(--purple), var(--gold)); }
+
+  .depth-value {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-dim);
+    font-size: 11px;
+    min-width: 80px;
+    text-align: right;
+  }
+
+  .funding-table th:nth-child(1),
+  .funding-table td:nth-child(1) { text-align: left; }
+
+  .footer {
+    text-align: center;
+    padding: 20px;
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+
+  .timestamp {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  @keyframes pulse-green {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .flash { animation: flash 0.4s ease; }
+  @keyframes flash {
+    0% { background: rgba(0, 230, 118, 0.15); }
+    100% { background: transparent; }
+  }
+
+  @media (max-width: 768px) {
+    .header { padding: 12px 16px; }
+    .main { padding: 12px 16px; }
+    .header-stats { gap: 16px; }
+    .stat-value { font-size: 14px; }
+    td, th { padding: 8px 10px; font-size: 12px; }
+    .depth-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">LIGHTER <span>Spread Scanner</span></div>
+  </div>
+  <div class="header-stats">
+    <div class="stat">
+      <span class="stat-label">交易对</span>
+      <span class="stat-value" id="symbol" style="color:var(--cyan)">ETH</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Lighter Mid</span>
+      <span class="stat-value price" id="lighter-mid">─</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">更新时间</span>
+      <span class="timestamp" id="update-time">等待连接...</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="size-control">
+      <label>交易量 $</label>
+      <input type="number" id="trade-size" value="10000" step="1000" min="1000">
+    </div>
+    <div class="ws-status">
+      <div class="ws-dot" id="ws-dot"></div>
+      <span id="ws-label">断开</span>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- Spread Table -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">价差排名 / Spread Rankings</span>
+      <span class="section-badge" id="exchange-count">0 交易所</span>
+    </div>
+    <p class="section-hint" style="font-size:12px;color:#8892a6;margin:0 0 10px 0;line-height:1.5;">
+      <strong>往返净利</strong> = <strong>腿1+腿2</strong> − <strong>2×(L_taker+X_taker)</strong>。
+      腿1=(X卖VWAP−L买VWAP)/L_mid×1e4，腿2=(L卖VWAP−X买VWAP)/L_mid×1e4，<strong>恒有 腿1+腿2=往返毛利</strong>。
+      旧版「单边」若只盯其中一腿为正，会误以为能赚钱；另一腿往往在快照上已为负，相加才是真相。
+      VWAP 已含吃单冲击；滑点列为参考勿重复扣减。
+    </p>
+    <table id="spread-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>状态</th>
+          <th>交易所</th>
+          <th>Mid 价格</th>
+          <th>Mid价差</th>
+          <th>腿1<br><span style="font-weight:normal;font-size:10px">X卖−L买</span></th>
+          <th>腿2<br><span style="font-weight:normal;font-size:10px">L卖−X买</span></th>
+          <th>往返毛利</th>
+          <th>往返费用</th>
+          <th>滑点L</th>
+          <th>滑点X</th>
+          <th>往返净利</th>
+          <th>方向</th>
+        </tr>
+      </thead>
+      <tbody id="spread-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Depth Overview -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">深度概览 / Depth Overview (前5档 USD)</span>
+    </div>
+    <div class="depth-grid" id="depth-grid"></div>
+  </div>
+
+  <!-- Convergence strategy -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">收敛策略模拟 / Convergence（等价差收窄再平）</span>
+    </div>
+    <p class="section-hint" style="font-size:12px;color:#8892a6;margin:0 0 12px 0;line-height:1.5;">
+      当 <strong>|对手Mid−Lighter Mid| / L_mid × 1e4</strong> 先 ≥ <strong>开仓阈值</strong> 时记为虚拟开仓（按 Mid 方向自动选 多L空X 或 多X空L），
+      再 ≤ <strong>平仓阈值</strong> 时用当前 VWAP 虚拟平仓。净利 = 开/平四笔 VWAP 毛利 − <strong>2×(L_taker+X_taker)</strong>。
+      为模拟统计，非下单指令；历史从本次启动 Web 起累计。
+    </p>
+    <div class="size-control" style="margin-bottom:14px;flex-wrap:wrap;gap:12px;">
+      <label style="color:var(--text-secondary);font-size:13px;">开仓 |ΔMid| ≥ <input type="number" id="conv-open" step="0.5" value="8" style="width:64px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);"> bps</label>
+      <label style="color:var(--text-secondary);font-size:13px;">平仓 |ΔMid| ≤ <input type="number" id="conv-close" step="0.5" value="3" style="width:64px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);"> bps</label>
+      <span class="val-muted" style="font-size:11px;">修改后约 0.5s 自动同步到服务器</span>
+    </div>
+    <table id="conv-table">
+      <thead>
+        <tr>
+          <th>交易所</th>
+          <th>状态</th>
+          <th>当前|ΔMid|</th>
+          <th>持仓秒</th>
+          <th>方向</th>
+          <th>完成笔数</th>
+          <th>上次净利</th>
+          <th>平均净利</th>
+          <th>胜率</th>
+          <th>往返费bps</th>
+        </tr>
+      </thead>
+      <tbody id="conv-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Funding Rates -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">资金费率差异 / Funding Rate Spread (归一化为每小时费率)</span>
+    </div>
+    <table class="funding-table" id="funding-table">
+      <thead>
+        <tr>
+          <th>交易所</th>
+          <th>交易所费率/h</th>
+          <th>Lighter费率/h</th>
+          <th>1h 差异</th>
+          <th>年化差异</th>
+        </tr>
+      </thead>
+      <tbody id="funding-body"></tbody>
+    </table>
+  </div>
+
+</div>
+
+<div class="footer">
+  Lighter Spread Scanner · 实时数据通过 WebSocket 推送 · 刷新间隔 2s
+</div>
+
+<script>
+const $  = id => document.getElementById(id);
+const fmt = (n, d=2) => n != null ? n.toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d}) : '─';
+const fmtPct = (n, d=6) => n != null ? (n*100).toFixed(d) + '%' : 'N/A';
+
+let ws = null;
+let reconnectDelay = 1000;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    $('ws-dot').classList.add('connected');
+    $('ws-label').textContent = '已连接';
+    reconnectDelay = 1000;
+  };
+
+  ws.onclose = () => {
+    $('ws-dot').classList.remove('connected');
+    $('ws-label').textContent = '重连中...';
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      render(data);
+    } catch(e) { console.error(e); }
+  };
+}
+
+function valClass(v, threshold=0) {
+  if (v > threshold) return 'val-positive';
+  if (v < -threshold) return 'val-negative';
+  return 'val-muted';
+}
+
+function render(data) {
+  if (!data) return;
+  $('symbol').textContent = data.symbol || '—';
+  $('lighter-mid').textContent = (data.lighter_mid != null && data.lighter_mid > 0) ? ('$' + fmt(data.lighter_mid)) : '—';
+  $('update-time').textContent = data.timestamp || '—';
+  const rows = Array.isArray(data.spreads) ? data.spreads : [];
+  $('exchange-count').textContent = rows.length + ' 交易所';
+
+  // Spread table
+  const tbody = $('spread-body');
+  let html = '';
+  if (rows.length === 0) {
+    html = '<tr><td colspan="13" class="val-muted" style="text-align:center;padding:24px;line-height:1.6;">'
+      + '暂无行情：请确认用 <strong>http://服务器IP:端口</strong> 打开（不要用本地文件 file://）。<br/>'
+      + '右上角 WebSocket 应为绿色「已连接」；请等待 10–30 秒让各所连上。若仍无数据，在 VPS 上执行 <code>tail -50 scanner.log</code> 看报错。'
+      + '</td></tr>';
+  } else for (const r of rows) {
+    const rowCls = r.net_profit_bps > 0 ? 'row-profitable' : 'row-unprofitable';
+    const dotCls = r.connected ? 'dot-connected' : 'dot-disconnected';
+    const dot = r.connected ? '●' : '○';
+    const mid = r.exchange_mid != null ? ('$' + fmt(r.exchange_mid)) : 'N/A';
+    const spreadCls = valClass(r.raw_spread_bps);
+    const netCls = r.net_profit_bps > 0.5 ? 'val-positive' : (r.net_profit_bps < -0.5 ? 'val-negative' : 'val-muted');
+    const profitCls = r.net_profit_bps > 3 ? 'profit-high' : '';
+    const dirCls = r.net_profit_bps > 0 ? 'val-positive' : (r.net_profit_bps > -2 ? 'val-warn' : 'val-muted');
+
+    const gross = r.round_trip_gross_bps != null ? r.round_trip_gross_bps : 0;
+    const grossCls = valClass(gross, 0);
+    const l1 = r.open_leg_buyL_sellX_bps != null ? r.open_leg_buyL_sellX_bps : 0;
+    const l2 = r.open_leg_buyX_sellL_bps != null ? r.open_leg_buyX_sellL_bps : 0;
+    const legCls = (v) => valClass(v, 0);
+    html += `<tr class="${rowCls}">
+      <td>${r.rank}</td>
+      <td><span class="${dotCls}">${dot}</span></td>
+      <td class="exchange-name">${r.exchange}</td>
+      <td>${mid}</td>
+      <td class="${spreadCls}">${r.raw_spread_bps >= 0 ? '+' : ''}${fmt(r.raw_spread_bps)}</td>
+      <td class="${legCls(l1)}">${l1 >= 0 ? '+' : ''}${fmt(l1)}</td>
+      <td class="${legCls(l2)}">${l2 >= 0 ? '+' : ''}${fmt(l2)}</td>
+      <td class="${grossCls}">${gross >= 0 ? '+' : ''}${fmt(gross)}</td>
+      <td class="val-muted">${fmt(r.total_fee_bps)}</td>
+      <td class="val-muted">${fmt(r.slippage_lighter_bps)}</td>
+      <td class="val-muted">${fmt(r.slippage_exchange_bps)}</td>
+      <td class="profit-cell ${profitCls} ${netCls}">${r.net_profit_bps >= 0 ? '+' : ''}${fmt(r.net_profit_bps)}</td>
+      <td class="direction-cell ${dirCls}">${r.direction}</td>
+    </tr>`;
+  }
+  tbody.innerHTML = html;
+
+  // Depth grid
+  const depthGrid = $('depth-grid');
+  let maxDepth = 1;
+  if (rows.length) {
+    maxDepth = Math.max(...rows.map(r => Math.max(r.depth_lighter || 0, r.depth_exchange || 0)), 1);
+  }
+  let depthHtml = '';
+  for (const r of rows) {
+    const lPct = Math.min((r.depth_lighter / maxDepth) * 100, 100);
+    const ePct = Math.min((r.depth_exchange / maxDepth) * 100, 100);
+    depthHtml += `
+      <div class="depth-item">
+        <span class="depth-name">${r.exchange}</span>
+        <div class="depth-bar-container">
+          <div class="depth-bar-track"><div class="depth-bar-fill lighter" style="width:${lPct}%"></div></div>
+          <span class="depth-value">$${fmtK(r.depth_lighter)}</span>
+        </div>
+        <div class="depth-bar-container">
+          <div class="depth-bar-track"><div class="depth-bar-fill exchange" style="width:${ePct}%"></div></div>
+          <span class="depth-value">$${fmtK(r.depth_exchange)}</span>
+        </div>
+      </div>`;
+  }
+  depthGrid.innerHTML = depthHtml;
+
+  // Funding table
+  const ftbody = $('funding-body');
+  let fhtml = '';
+  if (data.funding && data.funding.length > 0) {
+    for (const f of data.funding) {
+      const annCls = f.annualized_pct != null ? valClass(f.annualized_pct, 5) : 'val-muted';
+      const sp1Cls = f.spread_1h != null ? valClass(f.spread_1h * 10000, 0) : 'val-muted';
+      fhtml += `<tr>
+        <td class="exchange-name">${f.exchange}</td>
+        <td>${fmtPct(f.exchange_rate)}</td>
+        <td>${fmtPct(f.lighter_rate)}</td>
+        <td class="${sp1Cls}">${fmtPct(f.spread_1h)}</td>
+        <td class="${annCls}">${f.annualized_pct != null ? (f.annualized_pct >= 0 ? '+' : '') + fmt(f.annualized_pct) + '%' : 'N/A'}</td>
+      </tr>`;
+    }
+  } else {
+    fhtml = '<tr><td colspan="5" class="val-muted" style="text-align:center;padding:20px;">等待资金费率数据...</td></tr>';
+  }
+  ftbody.innerHTML = fhtml;
+
+  // Convergence simulation
+  const convBody = $('conv-body');
+  if (!convBody) { /* 旧版 HTML 无此区块 */ }
+  else if (!data.convergence) {
+    convBody.innerHTML = '<tr><td colspan="10" class="val-muted" style="text-align:center;padding:16px;">'
+      + '后端未包含收敛模块：请上传最新的 <code>web_scanner.py</code> 并重启服务。</td></tr>';
+  } else {
+    const convRows = Array.isArray(data.convergence.rows) ? data.convergence.rows : [];
+    const co = $('conv-open');
+    const cc = $('conv-close');
+    if (co && cc) {
+      if (document.activeElement !== co && data.convergence.open_bps != null) co.value = data.convergence.open_bps;
+      if (document.activeElement !== cc && data.convergence.close_bps != null) cc.value = data.convergence.close_bps;
+    }
+    let chtml = '';
+    if (convRows.length === 0) {
+      chtml = '<tr><td colspan="10" class="val-muted" style="text-align:center;padding:16px;">'
+        + '收敛表无行：请确认已更新 <code>web_scanner.py</code> + <code>feeds/convergence_tracker.py</code> 并重启。'
+        + '</td></tr>';
+    } else for (const r of convRows) {
+      const st = r.placeholder ? '<span class="val-warn">等连接</span>'
+        : (r.in_position ? '<span class="val-warn">持仓</span>' : '<span class="val-muted">空仓</span>');
+      const dir = r.direction || '—';
+      const lastNet = r.last_net_bps != null ? (r.last_net_bps >= 0 ? '+' : '') + fmt(r.last_net_bps) : '—';
+      const avgNet = r.avg_net_bps != null ? (r.avg_net_bps >= 0 ? '+' : '') + fmt(r.avg_net_bps) : '—';
+      const lastCls = r.last_net_bps != null ? valClass(r.last_net_bps, 0) : 'val-muted';
+      const avgCls = r.avg_net_bps != null ? valClass(r.avg_net_bps, 0) : 'val-muted';
+      chtml += `<tr>
+        <td class="exchange-name">${r.exchange}</td>
+        <td>${st}</td>
+        <td>${fmt(r.abs_spread_bps)}</td>
+        <td>${r.seconds_in_position != null ? r.seconds_in_position : '—'}</td>
+        <td>${dir}</td>
+        <td>${r.completed_count != null ? r.completed_count : 0}</td>
+        <td class="${lastCls}">${lastNet}</td>
+        <td class="${avgCls}">${avgNet}</td>
+        <td>${r.win_rate_pct != null ? r.win_rate_pct + '%' : '—'}</td>
+        <td class="val-muted">${fmt(r.fee_rt_bps)}</td>
+      </tr>`;
+    }
+    convBody.innerHTML = chtml;
+  }
+}
+
+function fmtK(n) {
+  if (n == null) return '─';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0) + 'K';
+  return Math.round(n).toString();
+}
+
+// Trade size input
+let sizeTimer = null;
+$('trade-size').addEventListener('input', function() {
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(() => {
+    const val = parseFloat(this.value);
+    if (val > 0 && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({type: 'set_size', size: val}));
+    }
+  }, 500);
+});
+
+let convTimer = null;
+function sendConvergence() {
+  if (!ws || ws.readyState !== 1) return;
+  const openBps = parseFloat($('conv-open').value);
+  const closeBps = parseFloat($('conv-close').value);
+  if (isNaN(openBps) || isNaN(closeBps)) return;
+  ws.send(JSON.stringify({type: 'set_convergence', open_bps: openBps, close_bps: closeBps}));
+}
+['conv-open', 'conv-close'].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('input', function() {
+    clearTimeout(convTimer);
+    convTimer = setTimeout(sendConvergence, 500);
+  });
+});
+
+connect();
+</script>
+</body>
+</html>

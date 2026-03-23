@@ -1,0 +1,1101 @@
+// Protobuf schema for Nord Engine.
+//
+// Every request sent to nord is an Action, which returns a Receipt.
+// A receipt may be a success or an error. Successful receipts contain
+// the action id that is assigned to the action, along with other useful
+// metadata about the action. For example, a place order action's receipt
+// will contain the list of fills and the order id of the posted order.
+//
+// # Encoding
+//
+// We use protobuf's length-delimited encoding for all messages. This is defined
+// as part of the protobuf spec[0] and offered by most protobuf implementations
+// (see rust's `prost` as an example[1]).
+//
+// Take the protobuf encoded Action to be `payload`, `len(x)` the varint
+// encoded length of `x`, and `sign(x)` the signature for the payload.
+// The message that is sent to nord is:
+//
+// ```
+// raw := len(payload) | payload
+// msg := raw | sign(raw)
+// ```
+//
+// Importantly, the length of the payload excludes the signature, and the
+// signature includes both the length of the payload and the payload itself.
+// The signature scheme differs per message type. See the next section.
+//
+// [0]: https://protobuf.dev/programming-guides/encoding/#length-types
+// [1]:
+// https://docs.rs/prost/latest/prost/trait.Message.html#method.encode_length_delimited
+//
+// # Signature scheme
+//
+// There are 3 signature schemes used, all based around Ed25519 signatures.
+// Let `hex(x)` be the hex-encoding of `x`.  We also have a special encoding
+// we'll call `solana_frame(x)`, which we need not detail here, but is covered
+// extensively in the typescript implementation. Take `ed25519_sign(x)` to be
+// the ed25519 signature of `x` wrt the user's ed25519 private key.
+//
+// ```
+// user_sign(x) => ed25519_sign(hex(x))
+// admin_sign(x) => ed25519_sign(solana_frame(x))
+// session_sign(x) => ed25519_sign(x)
+// ```
+//
+// - Admin operations use `admin_sign`.
+// - `CreateSession` and `RevokeSession` use `user_sign` with the user's wallet.
+// - Oracle updates use the oracle's proof, whichever the format.
+// - L1 actions (currently, just deposits) are sent through an authenticated
+// channel.
+// - All other use actions use `session_sign`.
+//
+// The reason admin's use the solana framed encoding is a workaround for the
+// ledger Solana app being unable to sign arbitrary data, and Solana not yet
+// having stabilized the Off-Chain Signing scheme. Hex encoding for user
+// messages refers to the `signMessage` API in Solana wallets. Sessions are
+// created by the library, so we just use the most convenient encoding for that.
+//
+// # Timestamp
+//
+// Notice that for the same action data `x`, `sign(x)` will produce the exact
+// same signature, so the final message will be identical. We need some way to
+// distinguish messages to avoid replay attacks. This is where the `timestamp`
+// and `nonce` fields in `Action` come into play.
+//
+// Nord's engine requires that all actions provide a `timestamp` field that is
+// within 60 seconds of the engine's current timestamp value. It's important to
+// note that although the engine's timestamp is usually close to the current
+// real time, it's not guaranteed to be true at all times. For example, if there
+// is downtime with our oracle provider, or there is a bug in fetching the
+// oracle prices, then the engine's timestamp may briefly not tick forward. So
+// it's good practice to fetch the current timestamp from the server before
+// sending an action if you need reliability.
+//
+// This timestamp scheme ensures that payloads for the same action change over
+// time. We check for duplicates within 60 seconds of the engine's timestamp.
+// Duplicates are rejected with the `DUPLICATE` error, and out of threshold with
+// `TIMESTAMP_OUT_OF_THRESHOLD`.
+//
+// Now, the nonce field is there if you are trying to send multiple identical
+// actions that have the same timestamp. This is rarely relevant for most users,
+// since most users place only a few operations per minute at most. However, if
+// you send actions at a high rate, then there is a chance that you will, say,
+// try to place the same order twice in the same second. In this case, you can
+// optionally provide a nonce to deduplicate it. You only need to advance the
+// nonce until the timestamp moves forward.
+//
+// # Sessions
+//
+// Sessions exist to improve the UX in web browsers. Essentially, we don't want
+// to have the user operate on the wallet dialog for every single operation.
+// Instead, we make them sign once and use the session key to sign all
+// subsequent actions. The session may be kept in the browser's memory or in
+// localStorage. Security is up to the implementer. There is an expiry timestamp
+// so that sessions invalidated eventually. If the user's session cap is hit,
+// then sessions are automatically revoked in order of expiry time.
+
+syntax = "proto3";
+
+package nord;
+
+enum Side {
+  ASK = 0;
+  BID = 1;
+}
+
+enum TriggerKind {
+  STOP_LOSS = 0;
+  TAKE_PROFIT = 1;
+}
+
+enum Intent {
+  DECREASE = 0;
+  INCREASE = 1;
+}
+
+enum FillMode {
+  LIMIT = 0;
+  POST_ONLY = 1;
+  IMMEDIATE_OR_CANCEL = 2;
+  FILL_OR_KILL = 3;
+}
+
+enum MarketType {
+  SPOT = 0;
+  PERPETUALS = 1;
+}
+
+enum TriggerExecError {
+  NO_POSITION = 0;
+  PLANNING_FAILED = 1;
+  BANKRUPTCY = 2;
+  RISK_CHECK_FAILED = 3;
+  REDUCE_ONLY_CHECK_FAILED = 4;
+}
+
+message FeeTierConfig {
+  uint32 maker_fee_ppm = 1;
+  uint32 taker_fee_ppm = 2;
+}
+
+message Market {
+  uint32 market_id = 1;
+  uint32 price_decimals = 2;
+  uint32 size_decimals = 3;
+  uint32 base_token_id = 4;
+  MarketType market_type = 5;
+  uint32 imf_bps = 6;
+  uint32 cmf_bps = 7;
+  uint32 mmf_bps = 8;
+  string view_symbol = 10;
+}
+
+message Token {
+  uint32 token_id = 1;
+  /// See CreateToken for details.
+  uint32 token_decimals = 2;
+  uint32 weight_bps = 4;
+  string view_symbol = 5;
+}
+
+enum SpecialAccount {
+  FEE_VAULT = 0;
+}
+
+// Helper struct to represent 128-bit
+// unsigned values.
+message U128 {
+  uint64 lo = 1; // lower 64 bits
+  uint64 hi = 2; // upper 64 bits
+}
+
+// quote_size = size * price, in decimals for specific market
+// Use current market if you want realistic tick step exisitng on market.
+// Use smaller prices for more granular quote size control,
+// but beware it will be neared to possible value in engine.
+
+message OrderLimit {
+  uint64 price = 6;
+  uint64 size = 7;
+  // Optional. Aggregated quote amount in `price_decimals + size_decimals`.
+  U128 quote_size = 8;
+}
+
+message PlaceType {
+  Side side = 3;
+  FillMode fill_mode = 4;
+  bool is_reduce_only = 5;
+}
+
+message TradeOrPlace {
+  uint32 market_id = 2;
+  PlaceType place_type = 3;
+  OrderLimit limit = 6;
+  // Must be strictly less than 2**63, i.e. can be encded as a non-negative
+  // signed 64-bit integer.
+  optional uint64 client_order_id = 33;
+}
+
+message CancelOrder { uint64 order_id = 2; }
+
+message TriggerKey {
+  TriggerKind kind = 3;
+  Side side = 4;
+}
+
+message AtomicSubactionKind {
+  oneof inner {
+    TradeOrPlace trade_or_place = 6;
+    CancelOrder cancel_order = 7;
+  }
+}
+
+message Atomic {
+  uint64 session_id = 1;
+  optional uint32 account_id = 2;
+  repeated AtomicSubactionKind actions = 6;
+}
+
+message TriggerPrices {
+  uint64 trigger_price = 1;
+  optional uint64 limit_price = 2;
+}
+
+message TriggerRecord {
+  TriggerKey key = 1;
+  TriggerPrices prices = 2;
+  uint32 market_id = 3;
+}
+
+// An action executed by the engine. This is the main message that is sent to
+// the server.
+message Action {
+  enum UserSignatureFraming {
+    HEX = 0;
+    SOLANA_TRANSACTION = 1;
+  }
+
+  message CreateSession {
+    // User's Ed25519 registration key, i.e. the wallet address. Must be 32
+    // bytes.
+    bytes user_pubkey = 1;
+    // The session's public key. Must be 32 bytes.
+    bytes session_pubkey = 2;
+    // Expiry time of the session, in unix timestamp. Relative to the engine's
+    // time.
+    int64 expiry_timestamp = 3;
+    // Alternatively frame the message as a Solana transaction.
+    // Defaults to hex if unset, to stay compatible with existing payloads.
+    optional UserSignatureFraming signature_framing = 4;
+  }
+
+  message CreateToken {
+
+    /// Example:
+    /// Settlement 1 ETH is 10**18 value.
+    /// With `token_decimals` of `10`, engine balance will have 1 ETH = 10**10
+    /// value. Rollup sends to engine and expects from engine 10**10 as 1 ETH
+    /// value. So if user has on balance 10**9 of ETH, it means he has 0.1 ETH
+    /// on engine balance and in settlement, but in settlement it will be
+    /// represented as 10**17 value. As consequence, if oracle gives index_price
+    /// of 1 ETH as it is in Ethereum, we must divide balance by
+    /// `10**token_decimals` and multiply by price to get USD value (do not
+    /// forget allow for rounding sub USD values). As for market price, to trade
+    /// 0.1 ETH,
+    // need to 1/10 / 10**token_decimals * 10**Market.size_decimals
+    uint32 token_decimals = 1;
+    uint32 weight_bps = 3;
+    string view_symbol = 4;
+    /// Used to bind to relevant oracle feed
+    string oracle_symbol = 5;
+    // On chain id for the wrapped asset on the rollup
+    bytes sol_addr = 6;
+    bytes acl_pubkey = 7;
+  }
+
+  message CreateMarket {
+    uint32 size_decimals = 1;
+    uint32 price_decimals = 2;
+    uint32 imf_bps = 3;
+    uint32 cmf_bps = 4;
+    uint32 mmf_bps = 5;
+    MarketType market_type = 6;
+    // Arbitrary human-readable market symbol, not to be confused with token's
+    // symbol
+    string view_symbol = 7;
+    // Oracle symbol which references specific price feed. Must be
+    // `oracle_symbol` of registered price feed
+    string oracle_symbol = 8;
+    // One of registered `token_id`'s.
+    //
+    // Base token for `MarketType::Spot`.
+    //
+    // Same as quote token id for `MarketType::Perpetual`. `oracle_symbol`
+    // identifies relevant price feed.
+    uint32 base_token_id = 9;
+    bytes acl_pubkey = 10;
+  }
+
+  // Note on order size.
+  // Any order being placed has absolute maximum size, which is 2^48-1.
+  // Although, this limit is applied not to initial order being placed
+  // but to final order being added to market's orderbook.
+  // This behavior exists because order can be limited by quote size,
+  // which converts to order size in a non-linear manner.
+  //
+  // Some orders can be executed immediately, in this no order will be added to
+  // orderbook, no order id created. Consider using `client_order_id` to track
+  // execution of such orders.
+  //
+  // Example: User posts order with size 2^48+100_000. Order fills counter
+  // orders and its size is reduced to 2^48-1_000_000 in process. This order
+  // will be added to orderbook successfully despite its initial size is above
+  // limit.
+  message PlaceOrder {
+    uint64 session_id = 1;
+    uint32 market_id = 2;
+    Side side = 3;
+    FillMode fill_mode = 4;
+    // A reduce-only order only reduces your current position, as opposed to
+    // increasing it. It means you can only use it to close a position. In
+    // contrast, non-reduce-only orders can reduce or increase your position.
+    // Reduce is handled by dynamically reducing or adjusting limit order's
+    // contract quantity
+    /// to match the contract size of the open position.
+    bool is_reduce_only = 5;
+    // Raw integral value of order limit price.
+    // `1` here equals to market's `10^-price_decimals`
+    // When used in token balances and reward computations, shifted by market's
+    // `price_decimals`. Optional, treated as not set if 0.
+    uint64 price = 6;
+    // Raw integral value of order size limit.
+    // For spot markers measured in base size,
+    // for perpetuals in contract token.
+    // So using base as default naming in codebase.
+    // `1` here equals to market's `10^-size_decimals`
+    // When used in token balances and reward computations, shifted by market's
+    // `size_decimals`. Optional, treated as not set if 0.
+    uint64 size = 7;
+    // Quote size limit aggregated in `price_decimals + size_decimals`.
+    // Optional.
+    U128 quote_size = 8;
+
+    // Optional account on behalf of whom the order should be placed.
+    // Executed only if sender has delegated authority to do so,
+    // like admin user or liquidator bot.
+    // # Delegation allowed if:
+    // - trigger
+    // - reduce bad position
+    // - sell at good price to reduce if cannot cover bad position
+    optional uint32 delegator_account_id = 32;
+
+    // Caller provided opaque order identifier up to 8 bytes.
+    // Not used by engine, but can be used by client to track orders.
+    optional uint64 client_order_id = 33;
+
+    // Account id which performs operation;
+    // if not specified, first account of session's owner user is picked
+    optional uint32 sender_account_id = 34;
+
+    // Opaque identifier chosen by the sender to be able to correlate this
+    // place order requests with the corresponding fill and place order events.
+    optional uint64 sender_tracking_id = 35;
+  }
+
+  message CancelOrderById {
+    uint64 session_id = 1;
+    uint64 order_id = 2;
+    optional uint32 delegator_account_id = 32;
+    optional uint32 sender_account_id = 33;
+  }
+
+  message CancelOrderByClientId {
+    uint64 session_id = 1;
+    uint64 client_order_id = 2;
+    optional uint32 sender_account_id = 3;
+  }
+
+  message Deposit {
+    // used for integration of rollup with nord app
+    uint64 action_nonce = 1;
+    bytes token_addr = 2;
+    // Shifted by the token's decimals.
+    uint64 amount = 3;
+    // Recipient's ed25519 registration public key, 32 bytes long
+    bytes user_pubkey = 4;
+    // Sender's ed25519 public key. Unused in nord, but must be forwarded
+    // through the system.
+    bytes sender_pubkey = 5;
+  }
+
+  // todo(n1): when gate will be here, remove or replace internals with message
+  message Withdraw {
+    uint32 token_id = 1;
+    uint64 session_id = 2;
+    // Shifted by the token's decimals.
+    uint64 amount = 3;
+    optional bytes dest_pubkey = 4;
+  }
+
+  message PythSetWormholeGuardians {
+    // See
+    // https://docs.wormholescan.io/#/Guardian/guardian-set
+    uint32 guardian_set_index = 1;
+    // Each address is 20 bytes, consisting of the last 20 bytes
+    // of the keccak256 hash of the public key of the guardian.
+    repeated bytes addresses = 2;
+    bytes acl_pubkey = 3;
+  }
+
+  // Associate a oracle symbol to a Pyth Feed ID.
+  message PythSetSymbolFeed {
+    string oracle_symbol = 1;
+    // MUST be 32 bytes.
+    bytes price_feed_id = 2;
+    bytes acl_pubkey = 3;
+  }
+
+  message PythPriceFeedUpdate {
+    // See https://hermes.pyth.network/docs/#/rest/latest_price_updates
+    bytes raw_pythnet_data = 1;
+  }
+
+  // Perform final account liquidation procedure.
+  // Can be executed only accounts with AV < 0 (bankrupt).
+  // After execution, `liquidatee_account_id` is removed from state.
+  // See MARKETS.md `Bankruptcy` for details.
+  message Liquidate {
+    uint64 liquidator_session_id = 1;
+    uint32 liquidatee_account_id = 2;
+    optional uint32 liquidator_account_id = 3;
+  }
+
+  message RevokeSession { uint64 session_id = 1; }
+
+  // The engine fails with a maintenance error while paused.
+  message Pause { bytes acl_pubkey = 1; }
+
+  message Unpause { bytes acl_pubkey = 1; }
+
+  message Recipient {
+    oneof recipient_type {
+      Special special = 1;
+      Owned owned = 2;
+      Unowned unowned = 3;
+    }
+
+    message Special {}
+
+    message Owned { uint32 account_id = 1; }
+
+    message Unowned { uint32 account_id = 1; }
+  }
+
+  // Transfers tokens to specified account.
+  message Transfer {
+    uint64 session_id = 1;
+    uint32 from_account_id = 2;
+    uint32 token_id = 3;
+    uint64 amount = 4;
+    // If target account id isn't specified, new account is created.
+    optional Recipient to_account_id = 8;
+  }
+
+  message FeeVaultTransfer {
+    bytes acl_pubkey = 1;
+    uint32 recipient = 2;
+    uint32 token_id = 3;
+    uint64 amount = 4;
+  }
+
+  message AddTrigger {
+    uint64 session_id = 1;
+    TriggerRecord trigger = 2;
+    Intent intent = 3;
+    optional uint32 account_id = 10;
+  }
+
+  message RemoveTrigger {
+    uint64 session_id = 1;
+    uint32 market_id = 2;
+    TriggerKey key = 3;
+    optional uint64 price = 4;
+    Intent intent = 5;
+    optional uint32 account_id = 10;
+  }
+
+  message AddFeeTier {
+    bytes acl_pubkey = 1;
+    FeeTierConfig config = 2;
+  }
+
+  message UpdateFeeTier {
+    uint32 id = 1;
+    FeeTierConfig config = 2;
+    bytes acl_pubkey = 3;
+  }
+
+  message UpdateAccountsTier {
+    uint32 tier_id = 1;
+    repeated uint32 accounts = 2;
+    bytes acl_pubkey = 3;
+  }
+
+  message UpdateAcl {
+    bytes acl_pubkey = 1;
+    bytes target_pubkey = 2;
+    uint32 roles_mask = 3;
+    uint32 roles_value = 4;
+  }
+
+  message FreezeMarket {
+    bytes acl_pubkey = 1;
+    uint32 market_id = 2;
+  }
+
+  message UnfreezeMarket {
+    bytes acl_pubkey = 1;
+    uint32 market_id = 2;
+  }
+
+  message ExecuteTrigger {
+    message Trigger {
+      uint64 price = 1;
+      TriggerKind kind = 2;
+      Side side = 3;
+      uint64 limit = 4;
+      Intent intent = 5;
+    }
+
+    uint64 executor_sid = 1;
+    uint32 account_id = 2;
+    uint32 market_id = 3;
+    Trigger trigger = 4;
+  }
+
+  message TakePosition {
+    uint64 session_id = 1;
+    uint32 market_id = 2;
+    // Amount to take.
+    int64 size = 3;
+
+    // Account id which performs operation;
+    // if not specified, first account of session's owner user is picked
+    optional uint32 sender_account_id = 4;
+
+    // If set, then it is take action.
+    // If price not so good as in field, take will fail.
+    //
+    // If not set,
+    // will do fill-or-kill order as per liquidation trade rule.
+    optional uint64 price = 5;
+  }
+
+  // Must be within 60s of the engine's current logical time, which
+  // should be within a few seconds of real time.
+  //
+  // Ignored for the `PythPriceFeedUpdate` action as that action updates
+  // the timestamp. Should be set to 0 in that case to omit it.
+  int64 current_timestamp = 1;
+
+  // Optional nonce to handle if user wants several identical transactions to be
+  // executed with `current_timestamp`. Sending exactly same transaction twice
+  // is rejected. In order to change signature of transaction(execute it once
+  // more time), nonce should be changed(incremented).
+  uint32 nonce = 2;
+
+  oneof kind {
+    CreateSession create_session = 4;
+    CreateToken create_token = 5;
+    CreateMarket create_market = 6;
+    PlaceOrder place_order = 7;
+    CancelOrderById cancel_order_by_id = 8;
+    Deposit deposit = 9;
+    Withdraw withdraw = 10;
+    PythSetWormholeGuardians pyth_set_wormhole_guardians = 11;
+    PythSetSymbolFeed pyth_set_symbol_feed = 12;
+    PythPriceFeedUpdate pyth_price_feed_update = 13;
+    Liquidate liquidate = 14;
+    RevokeSession revoke_session = 15;
+    Pause pause = 16;
+    Unpause unpause = 17;
+    Transfer transfer = 18;
+    AddTrigger add_trigger = 32;
+    RemoveTrigger remove_trigger = 33;
+    TakePosition take_position = 34;
+    Atomic atomic = 35;
+    FreezeMarket freeze_market = 36;
+    UnfreezeMarket unfreeze_market = 37;
+    AddFeeTier add_fee_tier = 38;
+    UpdateFeeTier update_fee_tier = 39;
+    UpdateAccountsTier update_accounts_tier = 40;
+    UpdateAcl update_acl = 41;
+    FeeVaultTransfer fee_vault_transfer = 42;
+    CancelOrderByClientId cancel_order_by_client_id = 44;
+    ExecuteTrigger execute_trigger = 45;
+  }
+}
+
+// The response of an action from the engine. Most actions have a corresponding
+// receipt kind, which you can deduce from the naming.
+message Receipt {
+  message Posted {
+    Side side = 1;
+    uint32 market_id = 2;
+    uint64 price = 3;
+    uint64 size = 4;
+    uint64 order_id = 5;
+    uint32 account_id = 6;
+  }
+
+  message Trade {
+    uint64 order_id = 2;
+    // non zero
+    uint64 price = 4;
+    uint64 size = 5;
+    uint32 account_id = 6;
+  }
+
+  message CreateSessionResult { uint64 session_id = 1; }
+  message CancelledTrigger {
+    uint32 account_id = 1;
+    TriggerRecord trigger = 2;
+  }
+  message PlaceOrderResult {
+    optional Posted posted = 1;
+    repeated Trade fills = 2;
+    optional uint64 client_order_id = 3;
+    optional uint64 sender_tracking_id = 4;
+    repeated CancelledTrigger cancelled_triggers = 5;
+  }
+
+  message TriggerExecuted {
+    uint32 executor_id = 1;
+    uint32 account_id = 2;
+    uint32 market_id = 3;
+    Action.ExecuteTrigger.Trigger trigger = 4;
+    oneof status {
+      PlaceOrderResult success = 5;
+      TriggerExecError failure = 6;
+      bool cancelled = 7;
+    }
+  }
+
+  message TakenResult {
+    int64 pnl = 1;
+    int64 size = 2;
+    uint32 taker_account_id = 3;
+  }
+
+  message PositionTakenOrTradedResult {
+    uint32 market_id = 1;
+    oneof position_taken_or_traded_kind {
+      TakenResult taken = 2;
+      // non empty if trade immediately
+      PlaceOrderResult traded = 3;
+    }
+    repeated TriggerRecord cancelled_triggers = 4;
+  }
+
+  message CancelOrderResult {
+    uint64 order_id = 1;
+    // Account from which order was cancelled
+    uint32 account_id = 2;
+    optional uint64 client_order_id = 3;
+  }
+
+  message DepositResult {
+    uint32 token_id = 1;
+    uint64 amount = 2;
+    // Default account of newly created or existing user
+    uint32 account_id = 3;
+    bool user_created = 4;
+    bytes user_pubkey = 5;
+  }
+
+  message InsertTokenResult {
+    bytes chain_addr = 1;
+    Token token = 2;
+  }
+
+  message InsertMarketResult { Market market = 1; }
+
+  message WithdrawResult {
+    uint32 token_id = 1;
+    uint64 amount = 2;
+    uint64 balance = 3;
+    uint32 account_id = 4;
+    uint64 fee = 5;
+    bytes user_pubkey = 6;
+  }
+
+  // pyth receipts are not user facing, so they can be terse and optional
+  message OracleSymbolFeedResult {
+    string oracle_symbol = 1;
+    bytes feed_id = 2;
+  }
+
+  message OracleUpdateResult { int64 timestamp = 1; }
+
+  message UpdateGuardianSetResult {
+    uint32 guardian_set_index = 1;
+    repeated bytes addresses = 2;
+  }
+
+  message PerpPosition {
+    uint32 market_id = 1;
+    int64 base_size = 2;
+    uint64 price = 3;
+  }
+
+  /// Result of bankruptcy liquidation.
+  message AccountLiquidated {
+    uint32 liquidator_account_id = 1;
+    uint32 liquidatee_account_id = 2;
+    repeated uint64 cancelled_orders = 3;
+    repeated PerpPosition removed_perps = 4;
+    repeated TriggerRecord cancelled_triggers = 5;
+  }
+
+  message SessionRevoked {}
+
+  message Paused {}
+
+  message Unpaused {}
+
+  message Recipient {
+    oneof recipient_type {
+      Special special = 1;
+      Owned owned = 2;
+      Unowned unowned = 3;
+    }
+
+    message Special {}
+
+    message Owned { uint32 account_id = 1; }
+
+    message Unowned { uint32 account_id = 1; }
+  }
+
+  message Transferred {
+    uint32 from_account_id = 1;
+    Recipient to_account = 2;
+    uint32 token_id = 3;
+    uint64 amount = 4;
+    bool account_created = 5;
+  }
+
+  message FeeVaultTransferred {
+    uint32 recipient = 1;
+    uint32 token_id = 2;
+    uint64 amount = 3;
+  }
+
+  message TriggerAdded {}
+
+  message TriggerRemoved {}
+
+  message MarketFreezeUpdated {
+    uint32 market_id = 1;
+    bool frozen = 2;
+  }
+
+  message FeeTierAdded { FeeTierConfig config = 1; }
+
+  message FeeTierUpdated {
+    uint32 id = 1;
+    FeeTierConfig config = 2;
+  }
+
+  message AccountsTierUpdated {
+    uint32 tier_id = 1;
+    repeated uint32 accounts = 2;
+  }
+
+  message AclUpdated {
+    bytes acl_pubkey = 1;
+    uint64 roles_mask = 2;
+    bytes target_pubkey = 3;
+    uint64 roles_value = 4;
+  }
+
+  message AtomicSubactionResultKind {
+    oneof inner {
+      // reusing existing messages -> way less code to change in nord, with some
+      // duplication of data unlike input, which is required to be very specific
+      // to be correct, receipts can be same to easy ingested into view and hist
+      PlaceOrderResult place_order_result = 1;
+      CancelOrderResult cancel_order = 2;
+    }
+  }
+
+  message AtomicResult { repeated AtomicSubactionResultKind results = 1; }
+
+  // Action id which was run to produce this receipt.
+  // In case of error it was next action id which did not incremented because of
+  // error.
+  uint64 action_id = 1;
+
+  oneof kind {
+    Error err = 32;
+    CreateSessionResult create_session_result = 33;
+    PlaceOrderResult trade_or_place = 34;
+    CancelOrderResult cancel_order_result = 35;
+    DepositResult deposit_result = 36;
+    InsertTokenResult insert_token_result = 37;
+    InsertMarketResult insert_market_result = 38;
+    WithdrawResult withdraw_result = 39;
+    OracleSymbolFeedResult oracle_symbol_feed_result = 40;
+    OracleUpdateResult oracle_update_result = 41;
+    UpdateGuardianSetResult update_guardian_set_result = 42;
+    AccountLiquidated liquidated = 43;
+    SessionRevoked session_revoked = 44;
+    Paused paused = 45;
+    Unpaused unpaused = 46;
+    Transferred transferred = 47;
+    TriggerAdded trigger_added = 64;
+    TriggerRemoved trigger_removed = 65;
+    PositionTakenOrTradedResult position_taken_or_traded = 66;
+    AtomicResult atomic = 67;
+    MarketFreezeUpdated market_freeze_updated = 68;
+    FeeTierAdded fee_tier_added = 69;
+    FeeTierUpdated fee_tier_updated = 70;
+    AccountsTierUpdated accounts_tier_updated = 71;
+    AclUpdated acl_updated = 72;
+    FeeVaultTransferred fee_vault_transferred = 73;
+    TriggerExecuted trigger_executed = 74;
+  }
+}
+
+// Error codes returned by the engine.
+// Some errors has 5bit prefix about error source and 3 bit suffix specifier.
+// Error source prefix indicates were too look into to fix error.
+// For example if order has bad input, it would be order relevant prefix.
+// But if order cannot apply results to balance, it would be balance relevant
+// prefix.
+enum Error {
+  DUPLICATE = 0;
+  INVALID_SIGNATURE = 3;
+  MARKET_NOT_FOUND = 4;
+  TOKEN_NOT_FOUND = 5;
+  USER_NOT_FOUND = 6;
+  SESSION_NOT_FOUND = 7;
+  ORDER_NOT_FOUND = 8;
+  ORDER_SIZE_ZERO = 9;
+
+  // 0000_1011
+  ARITHMETIC = 11;
+  // 0000_1100
+  ARITHMETIC_OVERFLOW = 12;
+  // 0000_1101
+  ARITHMETIC_UNDERFLOW = 13;
+  // 0000_1110
+  ARITHMETIC_DIVISION_BY_ZERO = 14;
+
+  KEY_ALREADY_REGISTERED = 15;
+  UPDATE_TIMESTAMP_IN_PAST = 17;
+  TOO_MANY_OPEN_ORDERS = 18;
+  WITHDRAW_AMOUNT_TOO_SMALL = 21;
+  INVALID_ORDER_OWNER = 22;
+
+  // 00100_000
+  DECODE_FAILURE = 32;
+  // 00100_001
+  DECODE_FAILURE_LENGTH_PREFIX = 33;
+  // Raw generated serde error
+  // 00100_002
+  DECODE_FAILURE_RAW = 34;
+  // Limitation of serde to specify types
+  // 00100_003
+  DECODE_FAILURE_DOMAIN = 35;
+  UPDATE_PUBLISH_TIME_IN_PAST = 36;
+
+  PYTH_FEED_NOT_ADDED = 93;
+  PYTH_FEED_MISSING = 94;
+  PYTH_FEED_ALREADY_ADDED = 95;
+  PYTH_GUARDIAN_SET_UNINITIALIZED = 96;
+  PYTH_GUARDIAN_SET_INVALID = 97;
+  PYTH_FEED_DECIMALS_OUT_OF_RANGE = 98;
+  PYTH_FEED_PRICE_OUT_OF_RANGE = 99;
+  PYTH_FEED_VARIANCE_OUT_OF_RANGE = 100;
+  PYTH_GUARDIAN_SET_AND_PYTH_SIGNATURE_DO_NOT_MATCH = 101;
+
+  INVALID_TOKEN_PARAMETERS = 102;
+  INDEX_PRICE_OUT_OF_RANGE = 103;
+  INDEX_DECIMALS_OUT_OF_RANGE = 104;
+  INVALID_STATE_VERSION = 105;
+
+  TIER_FEE_OUT_OF_RANGE = 106;
+  TIER_ID_OUT_OF_RANGE = 107;
+
+  INVALID_MARGINS = 108;
+
+  // Market's decimal parameters exceed either "quote limit" or "base limit"
+  // Two mentioned limits were deduced empirically and ensure
+  // that certain overflow errors don't happen when value rescaling is performed
+  // during order placement.
+  //
+  // For both perpetuals and spot markets,
+  // `quote_token.decimals - market.size_decimals - market.price_decimals` must
+  // be within range `[-19; 4]` For spot market, `base_token.decimals -
+  // market.size_decimals` must be within range `[-19; 23]`
+  MARKET_DECIMALS_EXCEED_LIMITS = 109;
+  TOO_MANY_TOKENS = 110;
+  FUNDING_OVERFLOW = 123;
+  // If there is order to cancel for position, it should be canceled first
+  // before reducing position
+  CAN_REDUCE_POSITION_ONLY_IF_ALL_ORDERS_ARE_CANCELED = 124;
+  // Token was found, but not expected to be used in action context
+  UNEXPECTED_TOKEN_ID = 127;
+  // Repeated order ID detected (duplicate OrderKey from client_order_id)
+  REPEATED_ORDER_ID = 128;
+  // Client order id is at least 2**63
+  CLIENT_ORDER_ID_TOO_LARGE = 129;
+
+  // happens in some situation when token misses some relevant information
+  // needed for operation, for example index price
+  TOKEN_NOT_READY = 130;
+  // Token with specified blockchain address already registered
+  TOKEN_ALREADY_REGISTERED = 112;
+
+  IMMEDIATE_ORDER_GOT_NO_FILLS = 133;
+  // In case there's no price, error if failed to fill at least one of limits
+  FAILED_TO_FILL_LIMIT = 134;
+  POST_ONLY_MUST_NOT_FILL_ANY_OPPOSITE_ORDERS = 135;
+  INVALID = 136;
+  // Any action stopped by admin for maintenance or other reason.
+  MAINTENANCE = 137;
+  MINIMUM_SIZE_DECIMALS = 138;
+  PARAMETERS_WILL_CREATE_NON_OPERATIONAL_MARKET = 139;
+  ONLY_IMMEDIATE_ORDERS_ALLOWED = 140;
+  TOO_MANY_USER_ACCOUNTS = 141;
+  // There's no such account with specified id,
+  ACCOUNT_NOT_FOUND = 142;
+  // Account doesn't belong to user designated by public key or session id
+  ACCOUNT_INVALID_OWNER = 143;
+  // Operation cannot be made on account because to small amount will be
+  // retained on account
+  DUST_ACCOUNT = 145;
+
+  // 10100_000
+  BALANCE = 160;
+  // 10100_001
+  BALANCE_DEPOSIT_OVERFLOW = 161;
+  // 10100_010
+  BALANCE_CHANGE_OVERFLOW = 162;
+  // 10100_011
+  BALANCE_CHANGE_LIMIT_EXCEEDED = 163;
+  // Happens when account balances has no sufficient token amount to perform
+  // action.
+  // 10100_100
+  BALANCE_INSUFFICIENT = 164;
+
+  // Happens when an action is meant to come from the settlement contract,
+  // but is not authenticated, instead coming from the user channels.
+  UNAUTHENTICATED_L1_ACTION = 165;
+
+  // Happens when an encoded action is too large. This is to mitigate dos
+  // attacks due to excessive padding.
+  ENCODED_ACTION_TOO_LARGE = 166;
+
+  // 10101_000
+  TRIGGER = 168;
+  // Happens when:
+  // * Trigger price is "less or equal" to its corresponding pair trigger price
+  // * Trigger rice is "less" than market's current index price
+  //
+  // Binary pattern: 10101_001
+  TRIGGER_INVALID_PRICE = 169;
+  TRIGGER_NOT_FOUND = 170;
+  TRIGGER_ONLY_DECREASE_ORDERS_SUPPORTED = 171;
+  TRIGGER_MAX_SIZE_PLACEMENT_EXCEEDED = 172;
+
+  // 10110_000
+  // Prefix which says that timestamp used as part of action is is not allowed
+  TIMESTAMP = 176;
+  // 10110_001
+  // Used to ensure that client is in sync with engine timestamp,
+  // to avoid replay attacks. Please update you client time periodically.
+  // See `Config::ACTION_TIMESTAMP_STALE_THRESHOLD` for range allowed to be out
+  // of timestamp value.
+  TIMESTAMP_OUT_OF_THRESHOLD = 177;
+  TIMESTAMP_STALE = 178;
+  // Expiry of entity with lifetime must be in future, specifically session.
+  EXPIRY_TIMESTAMP_IN_PAST = 16;
+
+  // 10111_000
+  // BANKRUPTCY = 184;
+  // 10111_001
+  BANKRUPTCY_INSUFFICIENT_COVERAGE = 185;
+  // 10111_010
+  // Account is not in bankruptcy state.
+  BANKRUPTCY_NOT_FOUND = 186;
+
+  // Cannot executed this action in case of bankruptcy.
+  // Source of error is BANKRUPTCY, which leads to NOT_ALLOWED.
+  // Not ideal to read by human, but follows the pattern.
+  // Seek for methods which need BANKRUPTCY and give BANKRUPTCY_NOT_FOUND if not
+  // a case.
+  BANKRUPTCY_NOT_ALLOWED = 187;
+
+  // 11000_000
+  // Happens when market is not read to handle orders
+  MARKET_NOT_READY = 192;
+
+  MARKET_FROZEN = 193;
+
+  // Happens when there is no liquidity on the market at the moment of trigger
+  // execution
+  MARKET_EMPTY = 194;
+
+  // 11001_000
+  POSITION = 200;
+  // Position not found for specific entity in specific market
+  POSITION_NOT_FOUND = 201;
+  POSITION_STATE_ORDER = 202;
+  POSITION_STATE_ORDER_PRICE = 203;
+  // position size size is smaller of counter orders (reduce counter orders
+  // cannot be bigger of position).  or order is small, but its price is bad of
+  // all other reduce orders and it cannot be added
+  POSITION_STATE_ORDER_SIZE = 204;
+  POSITION_STATE_ORDER_SIDE = 205;
+
+  // 1100_1110
+  // Maximuma size of single position exceeded.
+  // See `POSITION_SIZE_LIMIT` constant default limit for exacat value and
+  // details.
+  POSITION_SIZE_LIMIT = 206;
+  // 1100_1111
+  POSITION_STATE_PERP = 207;
+  POSITION_STATE_ORDER_DELEGATION = 208;
+
+  PRICE = 209;
+
+  SIGNATURE_VERIFICATION = 217;
+  SIGNATURE_VERIFICATION_MALFORMED_PUBLIC_KEY = 218;
+  SIGNATURE_VERIFICATION_INVALID_LENGTH = 219;
+
+  // 11011_000
+  // Error prefix which indicates that some actions cannot to be executed,
+  // if they move account into unhealthy(liquidatable) state
+  // or if liquidaiton handling action as parameterized cannot be executed
+  RISK = 224;
+
+  RISK_DELEGATION_MF_TO_BE_LESS_THAN_OR_EQUAL_MMF = 225;
+  RISK_OMF_LESS_THAN_OR_EQUAL_IMF = 226;
+  RISK_OMF_LESS_THAN_OR_EQUAL_CMF = 227;
+  // See `OMF < CMF` rule in MARKETS.md.
+  RISK_TRADE_OMF_LESS_THAN_OR_EQUAL_CMF = 229;
+  RISK_UNHEALTHY_MF_AND_PON_AFTER_BETTER_OF_BEFORE = 228;
+
+  // 1111_0000 = 240 -- 4 bit suffix
+  ORDER_EXECUTION = 240;
+  ORDER_EXECUTION_EMPTY = 241;
+  ORDER_EXECUTION_FILL_OR_KILL = 242;
+  // Order requires some of its limits specified according to fill mode
+  ORDER_EXECUTION_MISSING_LIMITS = 243;
+  ORDER_EXECUTION_MISSING_PRICE = 244;
+  ORDER_EXECUTION_SIZE_LIMIT = 245;
+  // 111_0110
+  // Price in order limit should be within acceptable range
+  ORDER_EXECUTION_LIMIT_PRICE = 246;
+
+  // Reduce orders can only be post only.
+  // 01111_0111 = 247
+  ORDER_REDUCE_IS_POST_ONLY = 247;
+  // Order was rejected, because it planned under proposed price
+  // 01111_1000 = 248
+  ORDER_EXECUTION_SELL_PRICE = 248;
+
+  ORDER_SIZE_EXCEEDS_POSITION_SIZE = 249;
+
+  // 10000_0000
+  ATOMICS = 256;
+  // 10000_0001
+  ATOMICS_TRADES_CANNOT_FOLLOW_PLACES = 257;
+  // 10000_0002
+  ATOMICS_CANCELS_CANNOT_FOLLOW_TRADES_PLACES = 258;
+
+  // 10001_0001
+  ACTION_POSITION_SHOULD_BE_COVERED = 273;
+  ACTION_INVALID_NONCE = 274;
+  ACTION_PROPOSED_PRICE_MUST_BE_HIGHER = 275;
+
+  ADMIN_ROLE_INSUFFICIENT = 276;
+  ADMIN_NOT_FOUND = 277;
+  UNIQUE_SUPER_ADMIN_CANNOT_BE_REMOVED = 278;
+  SUPER_ADMIN_ALREADY_EXISTS = 279;
+
+  // 10010_000
+  TRANSFER = 288;
+  // 10010_001
+  TRANSFER_TO_UNOWNED_ACCOUNT_IS_PROHIBITED = 289;
+  // 10010_010
+  TRANSFER_TO_OWNED_ACCOUNT_WAS_REQUESTED = 290;
+
+  NOT_IMPLEMENTED = 500;
+  ACTION_NOT_ALLOWED = 501;
+
+  DROPPED = 999;
+}
