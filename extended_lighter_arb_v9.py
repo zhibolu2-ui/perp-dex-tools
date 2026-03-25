@@ -919,16 +919,25 @@ class ExtMakerBot:
 
         self.logger.warning(
             f"[孤儿检测] 发现 {len(orphans)} 个未跟踪订单: {orphans}, "
-            f"执行 cancel_all")
+            f"执行 cancel_all (预期={expected_oidxs} "
+            f"WS追踪={self._active_lighter_oidxs})")
         self._cancel_grace_until = time.time() + 3.0
         await self._do_lighter_cancel_all()
         cleared = await self._wait_orders_cleared(3.0)
         remaining = self._active_lighter_oidxs - expected_oidxs
         if remaining:
-            self.logger.error(
-                f"[孤儿检测] cancel_all 后仍有 {len(remaining)} 个孤儿: "
-                f"{remaining}")
-            return False
+            for oidx in list(remaining):
+                try:
+                    await self._cancel_lighter_order(oidx)
+                except Exception:
+                    pass
+            await self._wait_orders_cleared(2.0)
+            remaining2 = self._active_lighter_oidxs - expected_oidxs
+            if remaining2:
+                self.logger.error(
+                    f"[孤儿检测] 逐个撤单后仍有 {len(remaining2)} 个孤儿: "
+                    f"{remaining2}")
+                return False
         self.logger.info("[孤儿检测] 孤儿订单已清除")
         return True
 
@@ -948,23 +957,23 @@ class ExtMakerBot:
                 auth=auth_token)
 
             if orders_resp is None:
+                self.logger.info("[REST对账] 响应为空, 视为无活跃订单")
+                phantom = set(self._active_lighter_oidxs)
+                if phantom:
+                    self._active_lighter_oidxs.clear()
+                    self._oidx_cleared_event.set()
+                    self.logger.info(
+                        f"[REST对账] 清除WS幻影: {phantom}")
                 return 0
 
             rest_oidxs = set()
-            order_list = []
-            if hasattr(orders_resp, 'orders') and orders_resp.orders:
-                order_list = orders_resp.orders
-            elif hasattr(orders_resp, 'data') and orders_resp.data:
-                order_list = orders_resp.data
+            for o in orders_resp.orders:
+                rest_oidxs.add(int(o.order_index))
 
-            for o in order_list:
-                oidx_val = None
-                if hasattr(o, 'order_index'):
-                    oidx_val = o.order_index
-                elif isinstance(o, dict):
-                    oidx_val = o.get('order_index')
-                if oidx_val is not None:
-                    rest_oidxs.add(int(oidx_val))
+            self.logger.info(
+                f"[REST对账] 链上活跃={len(rest_oidxs)} "
+                f"WS追踪={len(self._active_lighter_oidxs)} "
+                f"链上={rest_oidxs} WS={self._active_lighter_oidxs}")
 
             expected_oidxs = set()
             for m in [self._open_buy, self._open_sell, self._pending]:
@@ -980,7 +989,8 @@ class ExtMakerBot:
             orphans = rest_oidxs - expected_oidxs
             if orphans:
                 self.logger.warning(
-                    f"[REST对账] 发现 {len(orphans)} 个孤儿订单: {orphans}")
+                    f"[REST对账] 发现 {len(orphans)} 个孤儿订单: {orphans}, "
+                    f"执行cancel_all")
                 self._cancel_grace_until = time.time() + 3.0
                 await self._do_lighter_cancel_all()
                 await self._wait_orders_cleared(3.0)
@@ -995,7 +1005,8 @@ class ExtMakerBot:
 
             return 0
         except Exception as e:
-            self.logger.warning(f"[REST对账] 查询异常: {e}")
+            self.logger.warning(
+                f"[REST对账] 查询异常: {e}\n{traceback.format_exc()}")
             return -1
 
     async def _cancel_all_extended_orders_rest(self):
@@ -1059,7 +1070,10 @@ class ExtMakerBot:
                     self._pending.x_ref_at_place = x_ref_now
                     self._last_reprice = now
                     return True
-                self.logger.info(f"{tag} modify 失败, 回退 cancel+place")
+                if same_side:
+                    self.logger.info(
+                        f"{tag} modify 未成功, 下次重试(不回退cancel+place)")
+                    return True
 
             self.logger.info(
                 f"{tag} {self._pending.side}@{self._pending.price} → "
@@ -1140,15 +1154,13 @@ class ExtMakerBot:
                         self._open_sell_reprice_at = now
                     return True
                 self.logger.info(
-                    f"[调价] modify 失败, 回退 cancel+place {side}")
+                    f"[调价] {side} modify 未成功, 下次重试(不回退cancel+place)")
+                return True
 
             self._cancel_grace_until = time.time() + 2.0
-            if maker.lighter_order_index is not None:
-                await self._cancel_lighter_order(maker.lighter_order_index)
-            else:
-                self.logger.warning(
-                    f"[调价] {side} order_index 未知, cancel_all 兜底")
-                await self._do_lighter_cancel_all()
+            self.logger.warning(
+                f"[调价] {side} order_index 未知, cancel_all 兜底")
+            await self._do_lighter_cancel_all()
             cleared = await self._wait_orders_cleared(2.0)
             if not cleared:
                 self.logger.warning(
@@ -1658,25 +1670,33 @@ class ExtMakerBot:
 
             if self._active_lighter_oidxs:
                 self.logger.error(
-                    f"[退出] 仍有 {len(self._active_lighter_oidxs)} 个订单"
+                    f"[退出] WS追踪仍有 {len(self._active_lighter_oidxs)} 个订单"
                     f"未确认取消: {self._active_lighter_oidxs}")
 
             if not self.dry_run:
-                try:
-                    rest_orphans = await self._rest_reconcile_orders()
-                    if rest_orphans and rest_orphans > 0:
-                        self.logger.warning(
-                            f"[退出] REST对账发现 {rest_orphans} 个残留订单, "
-                            f"已触发 cancel_all, 等待确认...")
-                        await self._wait_orders_cleared(5.0)
-                        if self._active_lighter_oidxs:
-                            self.logger.error(
-                                f"[退出] REST对账后仍有活跃订单: "
-                                f"{self._active_lighter_oidxs}")
-                    elif rest_orphans == 0:
-                        self.logger.info("[退出] REST对账确认: 无残留Lighter订单")
-                except Exception as e:
-                    self.logger.warning(f"[退出] REST对账异常: {e}")
+                for rest_attempt in range(3):
+                    try:
+                        rest_orphans = await self._rest_reconcile_orders()
+                        if rest_orphans == 0:
+                            self.logger.info(
+                                "[退出] REST对账确认: 无残留Lighter订单")
+                            break
+                        if rest_orphans and rest_orphans > 0:
+                            self.logger.warning(
+                                f"[退出] REST对账发现 {rest_orphans} 个残留订单, "
+                                f"第{rest_attempt+1}次 cancel_all...")
+                            try:
+                                await self._do_lighter_cancel_all()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(2.0)
+                    except Exception as e:
+                        self.logger.warning(f"[退出] REST对账异常: {e}")
+                        try:
+                            await self._do_lighter_cancel_all()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
 
             if not self.dry_run:
                 try:
@@ -1729,6 +1749,19 @@ class ExtMakerBot:
             self.logger.info("交易客户端就绪")
             self.logger.info("[启动] 清理遗留挂单...")
             await self._do_lighter_cancel_all()
+            await asyncio.sleep(2.0)
+            try:
+                startup_orphans = await self._rest_reconcile_orders()
+                if startup_orphans and startup_orphans > 0:
+                    self.logger.warning(
+                        f"[启动] REST发现 {startup_orphans} 个残留订单, "
+                        f"再次 cancel_all")
+                    await self._do_lighter_cancel_all()
+                    await asyncio.sleep(2.0)
+                else:
+                    self.logger.info("[启动] Lighter 订单已清理干净")
+            except Exception as e:
+                self.logger.warning(f"[启动] REST对账异常: {e}")
             await self._cancel_all_extended_orders_rest()
         else:
             self.logger.info("[DRY-RUN] 跳过交易客户端初始化")
@@ -1937,7 +1970,7 @@ class ExtMakerBot:
                     cur_pos = abs(self.extended_position)
 
                 if (not self.dry_run
-                        and now - last_rest_order_reconcile > 60
+                        and now - last_rest_order_reconcile > 30
                         and self.state in (State.QUOTING, State.IN_POSITION)):
                     last_rest_order_reconcile = now
                     await self._rest_reconcile_orders()
