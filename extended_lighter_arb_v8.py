@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-Extended + Lighter 价差收敛套利 V8（全 Maker 零费用策略 + V7 全部改进）
+Extended + Lighter 价差收敛套利 V8（Maker 开仓 + Taker 并发平仓）
 
 策略：
-  开仓: Extended POST_ONLY maker 挂单，价格基于 Lighter BBO 计算。
+  开仓: Extended POST_ONLY maker 挂单（双边挂单），价格基于 Lighter BBO 计算。
          被成交后 → Lighter IOC taker 对冲。
-  平仓: Extended POST_ONLY 条件 maker 挂单（基于 basis gap + 时间衰减），
-         被成交后 → Lighter IOC taker 对冲。
+  平仓: 检测价差收敛 → Extended IOC taker + Lighter IOC taker **并发执行**。
+         两边同时市价平仓，消除逆向选择风险。
 
-费用: ~0 bps 往返 (Extended maker 0% + Lighter taker 0%)
+费用: ~2.5 bps 往返 (Extended maker 0% 开仓 + Extended taker ~2.5bps 平仓 + Lighter 0%)
 
-与 V7 的区别：
-  V7: 开仓 Extended taker (2.5bps费) → 成交快，但费用侵蚀利润，平仓窗口极窄
-  V8: 开仓 Extended maker (0费)     → 成交慢，但 0 费用，平仓窗口极宽
+与 maker 平仓的区别：
+  maker平仓: 被动等人吃单 → 逆选风险高（被吃 = 市场对你不利），滑点不可控
+  taker平仓: 主动出击 → 你选最佳时机并发平仓，费用固定 2.5bps，无逆选
 
 保留 V7 的全部改进：
   - Lighter WS 实时成交确认 + 实际成交价提取
   - 本地仓位更新（避免 REST 过期数据）
   - 对账后再紧急平仓（避免误判单边仓位）
-  - 条件 maker + 时间衰减平仓机制
+  - 时间衰减平仓条件（P1-P4 逐步放宽）
+  - 阶梯加仓（ladder-step）
   - 优雅退出
 
 用法:
-  python extended_lighter_arb_v8.py --symbol BTC --size 0.002 --target-spread 1.5
+  python extended_lighter_arb_v8.py --symbol BTC --size 0.002 --target-spread 3
   python extended_lighter_arb_v8.py --symbol ETH --dry-run
 """
 
@@ -96,7 +97,7 @@ class _Config:
 
 class ExtMakerBot:
 
-    ROUND_TRIP_FEE_BPS = 0.0
+    ROUND_TRIP_FEE_BPS = 2.5
 
     def __init__(
         self,
@@ -142,6 +143,7 @@ class ExtMakerBot:
         self._x_ioc_pending_id: Optional[str] = None
         self._x_ioc_confirmed = asyncio.Event()
         self._x_ioc_fill_qty: Decimal = Decimal("0")
+        self._x_ioc_fill_price: Optional[Decimal] = None
 
         self._open_x_refs: List[Tuple[Decimal, Decimal]] = []
         self._open_l_refs: List[Tuple[Decimal, Decimal]] = []
@@ -366,6 +368,12 @@ class ExtMakerBot:
         if self._x_ioc_pending_id and order_id == self._x_ioc_pending_id:
             if status in ("FILLED", "CANCELED", "EXPIRED"):
                 self._x_ioc_fill_qty = Decimal(str(filled_size_str))
+                avg = event.get("avg_price")
+                if avg:
+                    try:
+                        self._x_ioc_fill_price = Decimal(str(avg))
+                    except Exception:
+                        pass
                 self._x_ioc_confirmed.set()
             return
 
@@ -543,8 +551,20 @@ class ExtMakerBot:
                 else:
                     self.extended_position -= actual_fill
 
+                if direction == "long_X_short_L":
+                    _fill_sp = float(
+                        (l_actual - x_fill_price) / l_actual * 10000
+                    ) if l_actual > 0 else 0.0
+                else:
+                    _fill_sp = float(
+                        (x_fill_price - l_actual) / l_actual * 10000
+                    ) if l_actual > 0 else 0.0
+                _sp_quality = ("OK" if _fill_sp >= self.ROUND_TRIP_FEE_BPS
+                               else "LOW" if _fill_sp > 0 else "NEG")
                 self.logger.info(
                     f"[FAST_HEDGE] {hedge_ms:.0f}ms fill={actual_fill}/{hedge_qty} "
+                    f"实际价差={_fill_sp:.1f}bps({_sp_quality}) "
+                    f"X={x_fill_price:.2f} L={l_actual:.2f} "
                     f"X_pos={self.extended_position} L_pos={self.lighter_position}")
 
                 if self._pending.hedged_qty >= self._pending.filled_qty:
@@ -558,11 +578,12 @@ class ExtMakerBot:
                         self.position_opened_at = time.time()
                     self.position_direction = direction
                     if direction == "long_X_short_L":
-                        self._last_open_spread_bps = float(
+                        _actual_sp = float(
                             (l_actual - x_fill_price) / l_actual * 10000) if l_actual > 0 else 0.0
                     else:
-                        self._last_open_spread_bps = float(
+                        _actual_sp = float(
                             (x_fill_price - l_actual) / l_actual * 10000) if l_actual > 0 else 0.0
+                    self._last_open_spread_bps = max(_actual_sp, self.target_spread)
                     self._csv_row([
                         datetime.now(timezone.utc).isoformat(),
                         "OPEN", direction,
@@ -623,11 +644,200 @@ class ExtMakerBot:
                         self._reset_position_state()
                         self.state = State.QUOTING
                     else:
+                        self._normalize_refs(pos_remaining)
                         self.state = State.IN_POSITION
                 else:
                     self.logger.info(
                         f"[FAST_CLOSE] 部分对冲完成, 剩余待冲={self._pending.hedge_qty_needed}")
                     self.state = State.CLOSING_HEDGE
+
+    # ═══════════════════════════════════════════════
+    #  Parallel Taker Close (并发IOC平仓)
+    # ═══════════════════════════════════════════════
+
+    async def _parallel_taker_close(self, close_qty: Decimal) -> bool:
+        """Execute parallel IOC taker close on both exchanges simultaneously."""
+        if not self.position_direction:
+            return False
+
+        if self._pending and self._pending.hedge_qty_needed > 0:
+            self.logger.warning("[并发平仓] 跳过: 有待对冲的订单")
+            return False
+
+        if self._hedge_lock.locked():
+            self.logger.warning("[并发平仓] 跳过: hedge_lock 被占用")
+            return False
+
+        async with self._hedge_lock:
+            return await self._parallel_taker_close_inner(close_qty)
+
+    async def _parallel_taker_close_inner(self, close_qty: Decimal) -> bool:
+        ls = self.lighter_feed.snapshot if self.lighter_feed else None
+        x_bid, x_ask = self._get_extended_ws_bbo()
+
+        if not ls or not ls.mid or x_bid is None or x_ask is None:
+            self.logger.warning("[并发平仓] 行情不可用")
+            return False
+
+        if self.position_direction == "long_X_short_L":
+            x_side = "sell"
+            l_side = "buy"
+            x_ref = x_bid
+            l_ref = Decimal(str(ls.best_ask or ls.mid))
+        else:
+            x_side = "buy"
+            l_side = "sell"
+            x_ref = x_ask
+            l_ref = Decimal(str(ls.best_bid or ls.mid))
+
+        t0 = time.time()
+        self.logger.info(
+            f"[并发平仓] X:{x_side}@{x_ref:.2f} L:{l_side}@{l_ref:.2f} qty={close_qty}")
+
+        results = await asyncio.gather(
+            self._place_extended_ioc(x_side, close_qty, x_ref),
+            self._place_lighter_taker(l_side, close_qty, l_ref),
+            return_exceptions=True,
+        )
+        hedge_ms = (time.time() - t0) * 1000
+
+        x_fill = results[0] if not isinstance(results[0], Exception) else None
+        l_fill = results[1] if not isinstance(results[1], Exception) else None
+        if isinstance(results[0], Exception):
+            self.logger.error(f"[并发平仓] Extended 异常: {results[0]}")
+        if isinstance(results[1], Exception):
+            self.logger.error(f"[并发平仓] Lighter 异常: {results[1]}")
+
+        x_ok = x_fill is not None and x_fill > 0
+        l_ok = l_fill is not None and l_fill > 0
+
+        if not x_ok and not l_ok:
+            self.logger.warning(f"[并发平仓] 两边都失败 ({hedge_ms:.0f}ms)")
+            return False
+
+        if x_ok and not l_ok:
+            self.logger.error("[并发平仓] Lighter 失败, 立即重试...")
+            l_ref_retry = Decimal(str(
+                (ls.best_ask or ls.mid) if l_side == "buy"
+                else (ls.best_bid or ls.mid)))
+            l_fill = await self._place_lighter_taker(l_side, x_fill, l_ref_retry)
+            l_ok = l_fill is not None and l_fill > 0
+            if not l_ok:
+                self.logger.error("[并发平仓] Lighter 重试失败, 更新仓位后强制对账")
+                if x_side == "sell":
+                    self.extended_position -= x_fill
+                else:
+                    self.extended_position += x_fill
+                self._force_reconcile = True
+                return False
+
+        if not x_ok and l_ok:
+            self.logger.error("[并发平仓] Extended 失败, 立即重试...")
+            x_bid2, x_ask2 = self._get_extended_ws_bbo()
+            x_ref_retry = x_bid2 if x_side == "sell" else x_ask2
+            if x_ref_retry:
+                x_fill = await self._place_extended_ioc(x_side, l_fill, x_ref_retry)
+                x_ok = x_fill is not None and x_fill > 0
+            if not x_ok:
+                self.logger.error("[并发平仓] Extended 重试失败, 强制对账")
+                self._force_reconcile = True
+                return False
+
+        actual_close = min(x_fill, l_fill)
+        if x_side == "sell":
+            self.extended_position -= x_fill
+        else:
+            self.extended_position += x_fill
+
+        x_actual = self._x_ioc_fill_price or x_ref
+        l_actual = self._last_lighter_avg_price or l_ref
+
+        net_bps = self._log_ref_pnl(x_actual, l_actual, actual_close)
+        self.cumulative_net_bps += net_bps
+
+        l_mid_val = Decimal(str(ls.mid)) if ls.mid else l_ref
+        x_mid_val = (x_bid + x_ask) / 2
+        mid_bps = float((x_mid_val - l_mid_val) / l_mid_val * 10000) if l_mid_val > 0 else 0.0
+
+        self.logger.info(
+            f"[平仓完成] {hedge_ms:.0f}ms X_fill={x_fill} L_fill={l_fill} "
+            f"净利={net_bps:+.2f}bps 累积={self.cumulative_net_bps:+.2f}bps")
+        self._csv_row([
+            datetime.now(timezone.utc).isoformat(),
+            "CLOSE", "convergence",
+            x_side, f"{float(x_actual):.2f}", str(x_fill),
+            l_side, f"{float(l_actual):.2f}", str(l_fill),
+            f"{mid_bps:.2f}", f"{hedge_ms:.0f}",
+            f"{net_bps:.2f}", f"{self.cumulative_net_bps:.2f}",
+        ])
+
+        if x_fill != l_fill:
+            net_pos = abs(self.extended_position + self.lighter_position)
+            if net_pos > self.order_size * Decimal("0.5"):
+                self.logger.error(
+                    f"[并发平仓] 两边成交量不一致: X_fill={x_fill} L_fill={l_fill} "
+                    f"净头寸={net_pos}, 触发强制对账")
+                self._force_reconcile = True
+
+        pos_remaining = abs(self.extended_position)
+        if pos_remaining < self.order_size * Decimal("0.01"):
+            self._last_close_time = time.time()
+            if net_bps < 0:
+                self._consecutive_losses += 1
+            else:
+                self._consecutive_losses = 0
+            if (self._consecutive_losses >= 3
+                    or self.cumulative_net_bps < self._loss_breaker_threshold):
+                self._loss_breaker_until = time.time() + self._loss_breaker_duration
+                self.logger.error(
+                    f"[熔断] 连亏={self._consecutive_losses} "
+                    f"累积={self.cumulative_net_bps:+.2f}bps, "
+                    f"暂停{self._loss_breaker_duration:.0f}s")
+            self._reset_position_state()
+            self.state = State.QUOTING
+        else:
+            self._normalize_refs(pos_remaining)
+
+        return True
+
+    def _should_close_now(
+        self, l_bid: Decimal, l_ask: Decimal,
+        x_bid: Decimal, x_ask: Decimal,
+    ) -> bool:
+        """Check if spread has converged enough for profitable taker close."""
+        if self.extended_position > 0:
+            if not (self._open_x_refs and self._open_l_refs):
+                return False
+            x_avg = sum(p * q for p, q in self._open_x_refs) / sum(
+                q for _, q in self._open_x_refs)
+            l_avg = sum(p * q for p, q in self._open_l_refs) / sum(
+                q for _, q in self._open_l_refs)
+            opening_spread = l_avg - x_avg
+            fee_cost = x_avg * Decimal(str(self.ROUND_TRIP_FEE_BPS)) / Decimal("10000")
+            profit_target = x_avg * Decimal(str(self.close_profit_bps)) / Decimal("10000")
+            max_gap = opening_spread - fee_cost - profit_target
+            decay_bonus, self._decay_phase = self._calc_decay_bonus(fee_cost + profit_target)
+            max_gap += decay_bonus
+            current_gap = l_ask - x_bid
+            return current_gap <= max_gap
+
+        elif self.extended_position < 0:
+            if not (self._open_x_refs and self._open_l_refs):
+                return False
+            x_avg = sum(p * q for p, q in self._open_x_refs) / sum(
+                q for _, q in self._open_x_refs)
+            l_avg = sum(p * q for p, q in self._open_l_refs) / sum(
+                q for _, q in self._open_l_refs)
+            opening_spread = x_avg - l_avg
+            fee_cost = x_avg * Decimal(str(self.ROUND_TRIP_FEE_BPS)) / Decimal("10000")
+            profit_target = x_avg * Decimal(str(self.close_profit_bps)) / Decimal("10000")
+            max_gap = opening_spread - fee_cost - profit_target
+            decay_bonus, self._decay_phase = self._calc_decay_bonus(fee_cost + profit_target)
+            max_gap += decay_bonus
+            current_gap = x_ask - l_bid
+            return current_gap <= max_gap
+
+        return False
 
     # ═══════════════════════════════════════════════
     #  Maker Pricing
@@ -698,72 +908,6 @@ class ExtMakerBot:
         else:
             return decay_budget * Decimal("1.0"), "P4"
 
-    def _calc_close_maker_target(
-        self, l_bid: Decimal, l_ask: Decimal,
-        x_bid: Decimal, x_ask: Decimal,
-    ) -> Optional[Tuple[str, Decimal]]:
-        """Conditional close maker with time-based decay.
-
-        Returns a competitive price (near BBO) when the current basis gap
-        is small enough for a profitable close. Returns None when the basis
-        is too wide, signaling the caller to PULL any existing maker.
-
-        As hold time increases, max_gap is progressively widened via
-        _calc_decay_bonus to avoid costly timeout emergency flattens.
-        """
-        if self.extended_position > 0:
-            close_side = "sell"
-            if not (self._open_x_refs and self._open_l_refs):
-                return None
-
-            x_avg = sum(p * q for p, q in self._open_x_refs) / sum(q for _, q in self._open_x_refs)
-            l_avg = sum(p * q for p, q in self._open_l_refs) / sum(q for _, q in self._open_l_refs)
-
-            opening_spread = l_avg - x_avg
-            fee_cost = x_avg * Decimal(str(self.ROUND_TRIP_FEE_BPS)) / Decimal("10000")
-            profit_target = x_avg * Decimal(str(self.close_profit_bps)) / Decimal("10000")
-            max_gap = opening_spread - fee_cost - profit_target
-
-            decay_bonus, self._decay_phase = self._calc_decay_bonus(fee_cost + profit_target)
-            max_gap += decay_bonus
-
-            current_gap = l_ask - x_bid
-
-            if current_gap > max_gap:
-                return None
-
-            price = x_bid + self.extended_tick_size
-            if x_ask - x_bid > self.extended_tick_size * 2:
-                price = x_ask - self.extended_tick_size
-            return (close_side, self._round_extended_price(price))
-
-        elif self.extended_position < 0:
-            close_side = "buy"
-            if not (self._open_x_refs and self._open_l_refs):
-                return None
-
-            x_avg = sum(p * q for p, q in self._open_x_refs) / sum(q for _, q in self._open_x_refs)
-            l_avg = sum(p * q for p, q in self._open_l_refs) / sum(q for _, q in self._open_l_refs)
-
-            opening_spread = x_avg - l_avg
-            fee_cost = x_avg * Decimal(str(self.ROUND_TRIP_FEE_BPS)) / Decimal("10000")
-            profit_target = x_avg * Decimal(str(self.close_profit_bps)) / Decimal("10000")
-            max_gap = opening_spread - fee_cost - profit_target
-
-            decay_bonus, self._decay_phase = self._calc_decay_bonus(fee_cost + profit_target)
-            max_gap += decay_bonus
-
-            current_gap = x_ask - l_bid
-
-            if current_gap > max_gap:
-                return None
-
-            price = x_ask - self.extended_tick_size
-            if x_ask - x_bid > self.extended_tick_size * 2:
-                price = x_bid + self.extended_tick_size
-            if price <= 0:
-                return None
-            return (close_side, self._round_extended_price(price))
 
         return None
 
@@ -1195,7 +1339,7 @@ class ExtMakerBot:
                 reconnect_delay = min(reconnect_delay * 2, 30)
 
     # ═══════════════════════════════════════════════
-    #  Extended IOC (仅紧急平仓使用)
+    #  Extended IOC (平仓 + 紧急平仓)
     # ═══════════════════════════════════════════════
 
     async def _place_extended_ioc(self, side: str, qty: Decimal,
@@ -1210,6 +1354,7 @@ class ExtMakerBot:
         self._x_ioc_pending_id = None
         self._x_ioc_confirmed.clear()
         self._x_ioc_fill_qty = Decimal("0")
+        self._x_ioc_fill_price = None
 
         try:
             result = await self.extended_client.place_ioc_order(
@@ -1416,6 +1561,11 @@ class ExtMakerBot:
                 await self._cancel_all_extended_orders()
             except Exception as e:
                 self.logger.warning(f"[退出] Extended 撤单异常: {e}")
+            if not self.dry_run:
+                try:
+                    await self._cancel_all_extended_orders_rest()
+                except Exception as e:
+                    self.logger.warning(f"[退出] Extended REST兜底撤单异常: {e}")
             try:
                 await self._do_lighter_cancel_all()
             except Exception:
@@ -1449,7 +1599,7 @@ class ExtMakerBot:
                        f"最多{int(self.max_position / self.order_size)}层"
                        if self.ladder_step > 0 else "阶梯=关")
         self.logger.info(
-            f"启动 V8 Maker-Open+Maker-Close 零费用套利  {self.symbol}  "
+            f"启动 V8 Maker-Open+Taker-Close 套利  {self.symbol}  "
             f"size={self.order_size} max_pos={self.max_position}  "
             f"目标价差≥{self.target_spread}bps  "
             f"平仓利润缓冲={self.close_profit_bps}bps  "
@@ -1510,11 +1660,12 @@ class ExtMakerBot:
                     self._open_x_refs = [(x_est, x_qty)] if x_qty > 0 else []
                     self._open_l_refs = [(l_est, l_qty)] if l_qty > 0 else []
                     if self.position_direction == "long_X_short_L":
-                        self._last_open_spread_bps = float(
+                        _est_sp = float(
                             (l_est - x_est) / l_est * 10000)
                     else:
-                        self._last_open_spread_bps = float(
+                        _est_sp = float(
                             (x_est - l_est) / l_est * 10000)
+                    self._last_open_spread_bps = max(_est_sp, self.target_spread)
                     self.logger.info(
                         f"[启动] 使用当前价格估算开仓参考: X_ref={x_est:.2f}x{x_qty} "
                         f"L_ref={l_est:.2f}x{l_qty} spread={self._last_open_spread_bps:.1f}bps")
@@ -1812,13 +1963,15 @@ class ExtMakerBot:
                                     self.position_opened_at = time.time()
                                 self.position_direction = direction
                                 if direction == "long_X_short_L":
-                                    self._last_open_spread_bps = float(
+                                    _actual_sp = float(
                                         (l_actual - x_fill_price) / l_actual * 10000
                                     ) if l_actual > 0 else 0.0
                                 else:
-                                    self._last_open_spread_bps = float(
+                                    _actual_sp = float(
                                         (x_fill_price - l_actual) / l_actual * 10000
                                     ) if l_actual > 0 else 0.0
+                                self._last_open_spread_bps = max(
+                                    _actual_sp, self.target_spread)
                                 self._csv_row([
                                     datetime.now(timezone.utc).isoformat(),
                                     "OPEN", direction,
@@ -1909,46 +2062,41 @@ class ExtMakerBot:
 
                     if x_ws_bid is not None and x_ws_ask is not None and not self.dry_run:
                         should_add_layer = False
+                        current_dir_spread = 0.0
                         if (self.ladder_step > 0
                                 and cur_pos < self.max_position - self.order_size * Decimal("0.01")
                                 and self.position_direction
                                 and not data_stale):
-                            if self.position_direction == "long_X_short_L":
-                                current_dir_spread = float(
-                                    (l_mid - x_mid) / l_mid * 10000) if l_mid > 0 else 0.0
+                            hold_elapsed = (now - self.position_opened_at
+                                            if self.position_opened_at else 0)
+                            if hold_elapsed > self.max_hold_sec * 0.7:
+                                pass
                             else:
-                                current_dir_spread = float(
-                                    (x_mid - l_mid) / l_mid * 10000) if l_mid > 0 else 0.0
-                            if current_dir_spread > self._last_open_spread_bps + self.ladder_step:
-                                should_add_layer = True
+                                if self.position_direction == "long_X_short_L":
+                                    current_dir_spread = float(
+                                        (l_mid - x_mid) / l_mid * 10000) if l_mid > 0 else 0.0
+                                else:
+                                    current_dir_spread = float(
+                                        (x_mid - l_mid) / l_mid * 10000) if l_mid > 0 else 0.0
+                                if current_dir_spread > self._last_open_spread_bps + self.ladder_step:
+                                    should_add_layer = True
 
                         if should_add_layer:
-                            if (self._pending and self._pending.phase == "close"
-                                    and self._pending.filled_qty <= self._pending.hedged_qty):
-                                self.logger.info(
-                                    f"[阶梯] 价差扩大, 取消平仓 maker 转为加仓")
-                                self._cancel_grace_until = time.time() + 2.0
-                                await self._cancel_extended_order(
-                                    self._pending.order_id)
-                                await asyncio.sleep(0.1)
-                                if (self._pending
-                                        and self._pending.filled_qty
-                                        <= self._pending.hedged_qty):
-                                    self._pending = None
-
                             if self._pending is None or self._pending.phase == "open":
                                 max_layers = int(self.max_position / self.order_size)
                                 cur_layers = int(cur_pos / self.order_size) + 1
                                 spread_d = Decimal(str(self.target_spread))
+                                is_new_add = self._pending is None
                                 if self.position_direction == "long_X_short_L":
                                     add_price = self._round_extended_price(
                                         l_bid * (Decimal("1") - spread_d / Decimal("10000")))
                                     add_price = min(add_price, x_ws_ask - self.extended_tick_size)
                                     if add_price > 0 and add_price < x_ws_ask:
-                                        self.logger.info(
-                                            f"[阶梯] 加仓 {cur_layers}/{max_layers} "
-                                            f"spread={current_dir_spread:.1f}bps "
-                                            f"last={self._last_open_spread_bps:.1f}bps")
+                                        if is_new_add:
+                                            self.logger.info(
+                                                f"[阶梯] 加仓 {cur_layers}/{max_layers} "
+                                                f"spread={current_dir_spread:.1f}bps "
+                                                f"last={self._last_open_spread_bps:.1f}bps")
                                         await self._update_maker(
                                             "buy", "long_X_short_L",
                                             add_price, self.order_size, "open", l_bid)
@@ -1957,10 +2105,11 @@ class ExtMakerBot:
                                         l_ask * (Decimal("1") + spread_d / Decimal("10000")))
                                     add_price = max(add_price, x_ws_bid + self.extended_tick_size)
                                     if add_price > x_ws_bid:
-                                        self.logger.info(
-                                            f"[阶梯] 加仓 {cur_layers}/{max_layers} "
-                                            f"spread={current_dir_spread:.1f}bps "
-                                            f"last={self._last_open_spread_bps:.1f}bps")
+                                        if is_new_add:
+                                            self.logger.info(
+                                                f"[阶梯] 加仓 {cur_layers}/{max_layers} "
+                                                f"spread={current_dir_spread:.1f}bps "
+                                                f"last={self._last_open_spread_bps:.1f}bps")
                                         await self._update_maker(
                                             "sell", "long_L_short_X",
                                             add_price, self.order_size, "open", l_ask)
@@ -1978,29 +2127,13 @@ class ExtMakerBot:
                                         <= self._pending.hedged_qty):
                                     self._pending = None
 
-                            close_target = self._calc_close_maker_target(
-                                l_bid, l_ask, x_ws_bid, x_ws_ask)
-                            if close_target:
-                                c_side, c_price = close_target
+                            if (self._pending is None
+                                    and self._should_close_now(
+                                        l_bid, l_ask, x_ws_bid, x_ws_ask)):
                                 close_qty = abs(self.extended_position)
-                                if close_qty > 0 and now >= self._maker_pull_until:
-                                    await self._update_maker(
-                                        c_side, self.position_direction or "",
-                                        c_price, close_qty, "close")
-                            elif self._pending and self._pending.phase == "close":
-                                if self._pending.filled_qty <= self._pending.hedged_qty:
-                                    self.logger.info(
-                                        f"[PULL] basis too wide, cancelling close maker "
-                                        f"id={self._pending.order_id}")
-                                    self._cancel_grace_until = time.time() + 2.0
-                                    await self._cancel_extended_order(
-                                        self._pending.order_id)
-                                    await asyncio.sleep(0.1)
-                                    if (self._pending
-                                            and self._pending.filled_qty
-                                            <= self._pending.hedged_qty):
-                                        self._pending = None
-                                    self._maker_pull_until = time.time() + 3.0
+                                if close_qty > 0:
+                                    await self._parallel_taker_close(close_qty)
+                                    last_reconcile = time.time() - 50
 
                 # ━━━━━━ STATE: CLOSING_HEDGE ━━━━━━
                 elif self.state == State.CLOSING_HEDGE:
@@ -2078,6 +2211,7 @@ class ExtMakerBot:
                                     self._reset_position_state()
                                     self.state = State.QUOTING
                                 else:
+                                    self._normalize_refs(pos_remaining)
                                     self.state = State.IN_POSITION
                                 last_reconcile = time.time() - 50
                             else:
@@ -2140,6 +2274,25 @@ class ExtMakerBot:
             f"净利={total_net:+.3f}$({net_bps:+.1f}bps)")
         return net_bps
 
+    def _normalize_refs(self, remaining_qty: Decimal):
+        """After partial close, consolidate refs to match remaining position.
+
+        Prevents average cost drift when new layers are added on top of
+        partially closed positions.
+        """
+        if remaining_qty <= 0:
+            return
+        if self._open_x_refs:
+            x_qty = sum(q for _, q in self._open_x_refs)
+            if x_qty > remaining_qty:
+                x_avg = sum(p * q for p, q in self._open_x_refs) / x_qty
+                self._open_x_refs = [(x_avg, remaining_qty)]
+        if self._open_l_refs:
+            l_qty = sum(q for _, q in self._open_l_refs)
+            if l_qty > remaining_qty:
+                l_avg = sum(p * q for p, q in self._open_l_refs) / l_qty
+                self._open_l_refs = [(l_avg, remaining_qty)]
+
     def _reset_position_state(self):
         self.position_opened_at = None
         self.position_direction = None
@@ -2153,7 +2306,7 @@ class ExtMakerBot:
 
 def main():
     p = argparse.ArgumentParser(
-        description="V8 全Maker零费用套利 (Extended maker开仓 + maker平仓)")
+        description="V8 Maker开仓+Taker并发平仓套利 (Extended maker开仓 + IOC并发平仓)")
     p.add_argument("-s", "--symbol", default="ETH")
     p.add_argument("--size", type=str, default="0.1")
     p.add_argument("--max-position", type=str, default="0.5")
