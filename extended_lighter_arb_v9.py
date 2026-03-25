@@ -139,6 +139,7 @@ class ExtMakerBot:
         self._x_ioc_confirmed = asyncio.Event()
         self._x_ioc_fill_qty: Decimal = Decimal("0")
         self._x_ioc_fill_price: Optional[Decimal] = None
+        self._x_ioc_recent_ids: List[str] = []
 
         self._open_x_refs: List[Tuple[Decimal, Decimal]] = []
         self._open_l_refs: List[Tuple[Decimal, Decimal]] = []
@@ -337,11 +338,6 @@ class ExtMakerBot:
                     pass
         return None, None
 
-    def _extended_ob_age_ms(self) -> float:
-        if not self.extended_client or self.extended_client._ob_last_update_ts == 0:
-            return 999999.0
-        return (time.time() - self.extended_client._ob_last_update_ts) * 1000
-
     # ═══════════════════════════════════════════════
     #  Extended WS Event (IOC fill tracking only)
     # ═══════════════════════════════════════════════
@@ -361,6 +357,9 @@ class ExtMakerBot:
                     except Exception:
                         pass
                 self._x_ioc_confirmed.set()
+            return
+
+        if order_id in self._x_ioc_recent_ids:
             return
 
         if status in ("FILLED", "PARTIALLY_FILLED"):
@@ -723,9 +722,6 @@ class ExtMakerBot:
             return (price / self.lighter_tick).quantize(Decimal("1")) * self.lighter_tick
         return price
 
-    def _round_extended_price(self, price: Decimal) -> Decimal:
-        return price.quantize(self.extended_tick_size, rounding=ROUND_HALF_UP)
-
     def _calc_open_targets(
         self, l_bid: Decimal, l_ask: Decimal,
         x_bid: Decimal, x_ask: Decimal,
@@ -825,6 +821,7 @@ class ExtMakerBot:
             _, _, error = await self.lighter_client.cancel_order(
                 market_index=self.lighter_market_index,
                 order_index=order_index)
+            self._record_tx()
             if error is None:
                 self.logger.info(f"[Lighter] 撤单成功 oidx={order_index}")
                 return True
@@ -958,7 +955,7 @@ class ExtMakerBot:
                 self.logger.warning(
                     f"[调价] {side} order_index 未知, cancel_all 兜底")
                 await self._do_lighter_cancel_all()
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
             if self.state != State.QUOTING:
                 return True
@@ -1051,6 +1048,7 @@ class ExtMakerBot:
                 reduce_only=False,
                 trigger_price=0,
             )
+            self._record_tx()
             if error:
                 self._check_nonce_error(error)
                 self.logger.error(f"[Lighter] taker 失败: {error}")
@@ -1133,6 +1131,7 @@ class ExtMakerBot:
                 _, _, error = await self.lighter_client.cancel_all_orders(
                     time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                     timestamp_ms=future_ts_ms)
+                self._record_tx()
                 if error is None:
                     self.logger.info("[Lighter] cancel_all 执行成功")
                     return True
@@ -1247,11 +1246,17 @@ class ExtMakerBot:
                     actual = self._x_ioc_fill_qty
                 elif self._x_ioc_confirmed.is_set():
                     self.logger.warning("[Extended] IOC 已确认但 fill=0")
+                    self._x_ioc_recent_ids.append(self._x_ioc_pending_id)
+                    if len(self._x_ioc_recent_ids) > 20:
+                        self._x_ioc_recent_ids = self._x_ioc_recent_ids[-10:]
                     self._x_ioc_pending_id = None
                     return Decimal("0")
                 else:
                     self.logger.warning(f"[Extended] IOC 超时未确认, 假定成交 {qty_r}")
                     actual = qty_r
+                self._x_ioc_recent_ids.append(self._x_ioc_pending_id)
+                if len(self._x_ioc_recent_ids) > 20:
+                    self._x_ioc_recent_ids = self._x_ioc_recent_ids[-10:]
                 self._x_ioc_pending_id = None
                 return actual
             self.logger.error(f"[Extended] IOC 失败: {result.error_message}")
@@ -1325,7 +1330,8 @@ class ExtMakerBot:
                 side = "sell" if self.lighter_position > 0 else "buy"
                 ls = self.lighter_feed.snapshot if self.lighter_feed else None
                 if ls and ls.mid:
-                    ref = Decimal(str(ls.best_bid if side == "sell" else ls.best_ask))
+                    ref_val = (ls.best_bid or ls.mid) if side == "sell" else (ls.best_ask or ls.mid)
+                    ref = Decimal(str(ref_val or 0))
                     if ref > 0:
                         self.logger.info(
                             f"[紧急平仓] Lighter IOC {side} {abs(self.lighter_position)} @ {ref}")
@@ -1535,6 +1541,7 @@ class ExtMakerBot:
         self.logger.info(f"进入主循环  状态={self.state.value}")
         last_reconcile = time.time()
         last_status_log = 0.0
+        last_order_cleanup = time.time()
 
         while not self.stop_flag:
             try:
@@ -1706,6 +1713,17 @@ class ExtMakerBot:
                             await asyncio.sleep(self.interval)
                         continue
 
+                    if now - last_order_cleanup > 30:
+                        last_order_cleanup = now
+                        self._cancel_grace_until = time.time() + 3.0
+                        await self._do_lighter_cancel_all()
+                        await asyncio.sleep(0.5)
+                        if self._open_buy and self._open_buy.filled_qty == 0:
+                            self._open_buy = None
+                        if self._open_sell and self._open_sell.filled_qty == 0:
+                            self._open_sell = None
+                        self.logger.info("[定期清理] cancel_all 已执行, 重新挂单")
+
                     as_threshold = max(self.target_spread * 0.5, 1.0)
                     for side_name, maker, x_ref_now in [
                         ("buy", self._open_buy, x_ws_bid),
@@ -1722,7 +1740,7 @@ class ExtMakerBot:
                                     f" {x_move_bps:.1f}bps, 撤单")
                                 self._cancel_grace_until = time.time() + 2.0
                                 await self._safe_cancel_lighter(maker)
-                                await asyncio.sleep(0.15)
+                                await asyncio.sleep(0.5)
                                 if side_name == "buy":
                                     if (self._open_buy
                                             and self._open_buy.filled_qty == 0):
@@ -1847,8 +1865,9 @@ class ExtMakerBot:
                             self.logger.error("[HEDGE FAIL] Extended 对冲失败, 紧急反向平 Lighter")
                             l_side = self._pending.side
                             undo_side = "sell" if l_side == "buy" else "buy"
-                            l_ref = Decimal(str(ls.best_bid if undo_side == "sell"
-                                                else ls.best_ask or ls.mid or 0))
+                            l_ref = Decimal(str(
+                                (ls.best_bid or ls.mid or 0) if undo_side == "sell"
+                                else (ls.best_ask or ls.mid or 0)))
                             undo_ok = False
                             if l_ref > 0:
                                 undo_fill = await self._place_lighter_taker(
@@ -2011,19 +2030,32 @@ class ExtMakerBot:
                                         last_reconcile = time.time() - 50
                             elif (self._pending.phase == "close"
                                       and self._pending.filled_qty == 0):
-                                if self.position_direction == "long_X_short_L":
-                                    new_close_price = self._round_lighter_price(
-                                        l_bid + self.lighter_tick)
+                                if not self._should_close_now(
+                                        l_bid, l_ask, x_ws_bid, x_ws_ask):
+                                    self.logger.info(
+                                        "[平仓] gap 已扩大, 取消 close maker 等待重新收敛")
+                                    self._cancel_grace_until = time.time() + 2.0
+                                    await self._safe_cancel_lighter(self._pending)
+                                    await asyncio.sleep(0.3)
+                                    if (self._pending
+                                            and self._pending.filled_qty
+                                            <= self._pending.hedged_qty):
+                                        self._pending = None
                                 else:
-                                    new_close_price = self._round_lighter_price(
-                                        l_ask - self.lighter_tick)
-                                await self._update_maker(
-                                    self._pending.side,
-                                    self._pending.direction,
-                                    new_close_price,
-                                    abs(self.lighter_position),
-                                    "close",
-                                    x_ws_bid if self._pending.side == "buy" else x_ws_ask)
+                                    if self.position_direction == "long_X_short_L":
+                                        new_close_price = self._round_lighter_price(
+                                            l_bid + self.lighter_tick)
+                                    else:
+                                        new_close_price = self._round_lighter_price(
+                                            l_ask - self.lighter_tick)
+                                    await self._update_maker(
+                                        self._pending.side,
+                                        self._pending.direction,
+                                        new_close_price,
+                                        abs(self.lighter_position),
+                                        "close",
+                                        x_ws_bid if self._pending.side == "buy"
+                                        else x_ws_ask)
 
                 # ━━━━━━ STATE: CLOSING_HEDGE (Extended IOC 平仓对冲) ━━━━━━
                 elif self.state == State.CLOSING_HEDGE:
