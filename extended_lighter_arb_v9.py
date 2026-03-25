@@ -182,8 +182,6 @@ class ExtMakerBot:
         self._loss_breaker_duration: float = 300.0
 
         self._cancel_grace_until: float = 0.0
-        self._maker_pull_until: float = 0.0
-        self._decay_phase: str = ""
         self._force_reconcile: bool = False
         self._last_open_spread_bps: float = 0.0
         self._last_ladder_attempt: float = 0.0
@@ -623,15 +621,7 @@ class ExtMakerBot:
                     if self.position_opened_at is None:
                         self.position_opened_at = time.time()
                     self.position_direction = direction
-                    if direction == "long_X_short_L":
-                        _actual_sp = float(
-                            (l_fill_price - x_actual) / l_fill_price * 10000
-                        ) if l_fill_price > 0 else 0.0
-                    else:
-                        _actual_sp = float(
-                            (x_actual - l_fill_price) / l_fill_price * 10000
-                        ) if l_fill_price > 0 else 0.0
-                    self._last_open_spread_bps = max(_actual_sp, self.target_spread)
+                    self._last_open_spread_bps = max(_fill_sp, self.target_spread)
                     self._csv_row([
                         datetime.now(timezone.utc).isoformat(),
                         "OPEN", direction,
@@ -763,8 +753,6 @@ class ExtMakerBot:
             sell_result = ("sell", "long_X_short_L", sell_price)
 
         return buy_result, sell_result
-
-    # _calc_decay_bonus removed: V9 uses simple close_gap_bps threshold
 
     # ═══════════════════════════════════════════════
     #  Lighter Maker Order Management
