@@ -189,6 +189,8 @@ class ExtMakerBot:
 
         self._active_lighter_oidxs: set = set()
         self._oidx_cleared_event = asyncio.Event()
+        self._last_modify_ts: float = 0.0
+        self._min_modify_interval: float = 1.0
 
         os.makedirs("logs", exist_ok=True)
         self.csv_path = f"logs/arb_v9_{self.symbol}_trades.csv"
@@ -851,6 +853,12 @@ class ExtMakerBot:
     ) -> bool:
         if self.dry_run or not self.lighter_client:
             return True
+        now = time.time()
+        if now - self._last_modify_ts < self._min_modify_interval:
+            self.logger.debug(
+                f"[Lighter] 跳过 modify: 距上次仅"
+                f" {(now - self._last_modify_ts)*1000:.0f}ms")
+            return False
         if not self._check_tx_rate():
             self.logger.debug("[Lighter] 跳过 modify: 接近速率限制")
             return False
@@ -863,6 +871,7 @@ class ExtMakerBot:
                 price=int(rounded_price * self.price_multiplier),
             )
             self._record_tx()
+            self._last_modify_ts = time.time()
             if error is not None:
                 self._check_nonce_error(error)
                 self.logger.warning(
@@ -897,6 +906,97 @@ class ExtMakerBot:
                 f"{self._active_lighter_oidxs}")
             return False
         return True
+
+    async def _ensure_no_orphans(self) -> bool:
+        expected_oidxs = set()
+        for m in [self._open_buy, self._open_sell, self._pending]:
+            if m and m.lighter_order_index is not None:
+                expected_oidxs.add(m.lighter_order_index)
+
+        orphans = self._active_lighter_oidxs - expected_oidxs
+        if not orphans:
+            return True
+
+        self.logger.warning(
+            f"[孤儿检测] 发现 {len(orphans)} 个未跟踪订单: {orphans}, "
+            f"执行 cancel_all")
+        self._cancel_grace_until = time.time() + 3.0
+        await self._do_lighter_cancel_all()
+        cleared = await self._wait_orders_cleared(3.0)
+        remaining = self._active_lighter_oidxs - expected_oidxs
+        if remaining:
+            self.logger.error(
+                f"[孤儿检测] cancel_all 后仍有 {len(remaining)} 个孤儿: "
+                f"{remaining}")
+            return False
+        self.logger.info("[孤儿检测] 孤儿订单已清除")
+        return True
+
+    async def _rest_reconcile_orders(self) -> int:
+        if self.dry_run or not self.lighter_client:
+            return 0
+        try:
+            auth_token, err = self.lighter_client.create_auth_token_with_expiry(
+                api_key_index=self.api_key_index)
+            if err is not None:
+                self.logger.warning(f"[REST对账] auth token 失败: {err}")
+                return -1
+
+            orders_resp = await self.lighter_client.order_api.account_active_orders(
+                account_index=self.account_index,
+                market_id=self.lighter_market_index,
+                auth=auth_token)
+
+            if orders_resp is None:
+                return 0
+
+            rest_oidxs = set()
+            order_list = []
+            if hasattr(orders_resp, 'orders') and orders_resp.orders:
+                order_list = orders_resp.orders
+            elif hasattr(orders_resp, 'data') and orders_resp.data:
+                order_list = orders_resp.data
+
+            for o in order_list:
+                oidx_val = None
+                if hasattr(o, 'order_index'):
+                    oidx_val = o.order_index
+                elif isinstance(o, dict):
+                    oidx_val = o.get('order_index')
+                if oidx_val is not None:
+                    rest_oidxs.add(int(oidx_val))
+
+            expected_oidxs = set()
+            for m in [self._open_buy, self._open_sell, self._pending]:
+                if m and m.lighter_order_index is not None:
+                    expected_oidxs.add(m.lighter_order_index)
+
+            ws_missed = rest_oidxs - self._active_lighter_oidxs
+            if ws_missed:
+                self.logger.warning(
+                    f"[REST对账] WS未追踪的链上订单: {ws_missed}")
+                self._active_lighter_oidxs.update(ws_missed)
+
+            orphans = rest_oidxs - expected_oidxs
+            if orphans:
+                self.logger.warning(
+                    f"[REST对账] 发现 {len(orphans)} 个孤儿订单: {orphans}")
+                self._cancel_grace_until = time.time() + 3.0
+                await self._do_lighter_cancel_all()
+                await self._wait_orders_cleared(3.0)
+                return len(orphans)
+
+            phantom = self._active_lighter_oidxs - rest_oidxs
+            if phantom:
+                self.logger.info(
+                    f"[REST对账] WS多追踪的幻影订单(已不在链上): {phantom}")
+                self._active_lighter_oidxs -= phantom
+                self._oidx_cleared_event.set()
+
+            return 0
+        except Exception as e:
+            self.logger.warning(f"[REST对账] 查询异常: {e}")
+            return -1
 
     async def _cancel_all_extended_orders_rest(self):
         if self.dry_run or not self.extended_client:
@@ -971,13 +1071,20 @@ class ExtMakerBot:
             else:
                 self.logger.warning("[调价] order_index 未知, cancel_all 兜底")
                 await self._do_lighter_cancel_all()
-            await self._wait_orders_cleared(2.0)
+            um_cleared = await self._wait_orders_cleared(2.0)
             if self._pending is not saved:
                 self.logger.warning(f"{tag} cancel 期间发生成交, 保持当前状态")
+                return self._pending is not None
+            if not um_cleared:
+                self.logger.warning(f"{tag} 撤单未确认, 跳过本次调价")
                 return self._pending is not None
             if self._pending and self._pending.filled_qty > self._pending.hedged_qty:
                 return True
             self._pending = None
+
+        if not await self._ensure_no_orphans():
+            self.logger.warning(f"[调价] 仍有孤儿订单, 跳过下单")
+            return self._pending is not None
 
         coi = await self._place_lighter_maker_at(target_side, qty, target_price)
         if coi is not None:
@@ -1042,7 +1149,11 @@ class ExtMakerBot:
                 self.logger.warning(
                     f"[调价] {side} order_index 未知, cancel_all 兜底")
                 await self._do_lighter_cancel_all()
-            await self._wait_orders_cleared(2.0)
+            cleared = await self._wait_orders_cleared(2.0)
+            if not cleared:
+                self.logger.warning(
+                    f"[调价] {side} 撤单未确认, 跳过本次调价")
+                return False
 
             if self.state != State.QUOTING:
                 return True
@@ -1059,6 +1170,11 @@ class ExtMakerBot:
 
         if self.state != State.QUOTING:
             return True
+
+        if not await self._ensure_no_orphans():
+            self.logger.warning(
+                f"[调价] {side} 仍有孤儿订单, 跳过下单")
+            return False
 
         coi = await self._place_lighter_maker_at(side, self.order_size, target_price)
         if coi:
@@ -1097,11 +1213,16 @@ class ExtMakerBot:
         if need_cancel_all:
             self.logger.warning("[撤单] 有挂单缺少order_index, cancel_all兜底")
             await self._do_lighter_cancel_all()
-        await self._wait_orders_cleared(2.0)
-        if self._open_buy and self._open_buy.filled_qty == 0:
-            self._open_buy = None
-        if self._open_sell and self._open_sell.filled_qty == 0:
-            self._open_sell = None
+        cleared = await self._wait_orders_cleared(2.0)
+        if cleared:
+            if self._open_buy and self._open_buy.filled_qty == 0:
+                self._open_buy = None
+            if self._open_sell and self._open_sell.filled_qty == 0:
+                self._open_sell = None
+        else:
+            self.logger.warning(
+                f"[撤单] 等待确认超时, 不清除本地状态, "
+                f"残留={len(self._active_lighter_oidxs)}")
 
     # ═══════════════════════════════════════════════
     #  Lighter Taker (IOC — kept for emergency flatten)
@@ -1542,6 +1663,23 @@ class ExtMakerBot:
 
             if not self.dry_run:
                 try:
+                    rest_orphans = await self._rest_reconcile_orders()
+                    if rest_orphans and rest_orphans > 0:
+                        self.logger.warning(
+                            f"[退出] REST对账发现 {rest_orphans} 个残留订单, "
+                            f"已触发 cancel_all, 等待确认...")
+                        await self._wait_orders_cleared(5.0)
+                        if self._active_lighter_oidxs:
+                            self.logger.error(
+                                f"[退出] REST对账后仍有活跃订单: "
+                                f"{self._active_lighter_oidxs}")
+                    elif rest_orphans == 0:
+                        self.logger.info("[退出] REST对账确认: 无残留Lighter订单")
+                except Exception as e:
+                    self.logger.warning(f"[退出] REST对账异常: {e}")
+
+            if not self.dry_run:
+                try:
                     await self._cancel_all_extended_orders_rest()
                 except Exception as e:
                     self.logger.warning(f"[退出] Extended REST兜底撤单异常: {e}")
@@ -1648,6 +1786,7 @@ class ExtMakerBot:
         last_reconcile = time.time()
         last_status_log = 0.0
         last_order_cleanup = time.time()
+        last_rest_order_reconcile = time.time()
 
         while not self.stop_flag:
             try:
@@ -1699,9 +1838,13 @@ class ExtMakerBot:
                                     self._pending.lighter_order_index)
                             else:
                                 await self._do_lighter_cancel_all()
-                            await self._wait_orders_cleared(2.0)
-                            if self._pending and self._pending.filled_qty <= self._pending.hedged_qty:
-                                self._pending = None
+                            ds_cleared = await self._wait_orders_cleared(2.0)
+                            if ds_cleared:
+                                if self._pending and self._pending.filled_qty <= self._pending.hedged_qty:
+                                    self._pending = None
+                            else:
+                                self.logger.warning(
+                                    "[数据过期] pending撤单未确认, 保留状态")
                         self._maker_pulled = True
                     if self.state not in (State.HEDGING, State.CLOSING_HEDGE):
                         await asyncio.sleep(self.interval)
@@ -1793,6 +1936,12 @@ class ExtMakerBot:
                     last_reconcile = now
                     cur_pos = abs(self.extended_position)
 
+                if (not self.dry_run
+                        and now - last_rest_order_reconcile > 60
+                        and self.state in (State.QUOTING, State.IN_POSITION)):
+                    last_rest_order_reconcile = now
+                    await self._rest_reconcile_orders()
+
                 # ━━━━━━ STATE: QUOTING (双边Lighter挂单) ━━━━━━
                 if self.state == State.QUOTING:
                     if x_ws_bid is None or x_ws_ask is None:
@@ -1827,11 +1976,16 @@ class ExtMakerBot:
                         if not cleared:
                             for oidx in list(self._active_lighter_oidxs):
                                 await self._cancel_lighter_order(oidx)
-                            await self._wait_orders_cleared(2.0)
-                        if self._open_buy and self._open_buy.filled_qty == 0:
-                            self._open_buy = None
-                        if self._open_sell and self._open_sell.filled_qty == 0:
-                            self._open_sell = None
+                            cleared = await self._wait_orders_cleared(2.0)
+                        if cleared:
+                            if self._open_buy and self._open_buy.filled_qty == 0:
+                                self._open_buy = None
+                            if self._open_sell and self._open_sell.filled_qty == 0:
+                                self._open_sell = None
+                        else:
+                            self.logger.warning(
+                                "[定期清理] 订单未全部确认取消, "
+                                "保留本地状态防止孤儿订单")
                         self.logger.info(
                             f"[定期清理] 完成, 残留活跃订单="
                             f"{len(self._active_lighter_oidxs)}")
@@ -1852,15 +2006,20 @@ class ExtMakerBot:
                                     f" {x_move_bps:.1f}bps, 撤单")
                                 self._cancel_grace_until = time.time() + 2.0
                                 await self._safe_cancel_lighter(maker)
-                                await self._wait_orders_cleared(2.0)
-                                if side_name == "buy":
-                                    if (self._open_buy
-                                            and self._open_buy.filled_qty == 0):
-                                        self._open_buy = None
+                                as_cleared = await self._wait_orders_cleared(2.0)
+                                if as_cleared:
+                                    if side_name == "buy":
+                                        if (self._open_buy
+                                                and self._open_buy.filled_qty == 0):
+                                            self._open_buy = None
+                                    else:
+                                        if (self._open_sell
+                                                and self._open_sell.filled_qty == 0):
+                                            self._open_sell = None
                                 else:
-                                    if (self._open_sell
-                                            and self._open_sell.filled_qty == 0):
-                                        self._open_sell = None
+                                    self.logger.warning(
+                                        f"[逆选保护] {side_name} 撤单未确认, "
+                                        f"保留本地状态")
 
                     buy_target, sell_target = self._calc_open_targets(
                         l_bid, l_ask, x_ws_bid, x_ws_ask)
@@ -1873,10 +2032,11 @@ class ExtMakerBot:
                         elif self._open_buy and self._open_buy.filled_qty == 0:
                             self._cancel_grace_until = time.time() + 2.0
                             await self._safe_cancel_lighter(self._open_buy)
-                            await self._wait_orders_cleared(1.5)
-                            if (self._open_buy
-                                    and self._open_buy.filled_qty == 0):
-                                self._open_buy = None
+                            b_cleared = await self._wait_orders_cleared(1.5)
+                            if b_cleared:
+                                if (self._open_buy
+                                        and self._open_buy.filled_qty == 0):
+                                    self._open_buy = None
 
                         if sell_target:
                             _, s_dir, s_price = sell_target
@@ -1885,10 +2045,11 @@ class ExtMakerBot:
                         elif self._open_sell and self._open_sell.filled_qty == 0:
                             self._cancel_grace_until = time.time() + 2.0
                             await self._safe_cancel_lighter(self._open_sell)
-                            await self._wait_orders_cleared(1.5)
-                            if (self._open_sell
-                                    and self._open_sell.filled_qty == 0):
-                                self._open_sell = None
+                            s_cleared = await self._wait_orders_cleared(1.5)
+                            if s_cleared:
+                                if (self._open_sell
+                                        and self._open_sell.filled_qty == 0):
+                                    self._open_sell = None
                     elif buy_target or sell_target:
                         if now - last_status_log > 10:
                             parts = []
@@ -2111,11 +2272,15 @@ class ExtMakerBot:
                                     self.logger.warning(
                                         "[阶梯] order_index 未知, cancel_all 兜底")
                                     await self._do_lighter_cancel_all()
-                                await self._wait_orders_cleared(2.0)
-                                if (self._pending
-                                        and self._pending.filled_qty
-                                        <= self._pending.hedged_qty):
-                                    self._pending = None
+                                ladder_cleared = await self._wait_orders_cleared(2.0)
+                                if ladder_cleared:
+                                    if (self._pending
+                                            and self._pending.filled_qty
+                                            <= self._pending.hedged_qty):
+                                        self._pending = None
+                                else:
+                                    self.logger.warning(
+                                        "[阶梯] 撤单未确认, 保留pending状态")
 
                             if self._pending is None:
                                 if self._should_close_now(
@@ -2148,11 +2313,16 @@ class ExtMakerBot:
                                         "[平仓] gap 已扩大, 取消 close maker 等待重新收敛")
                                     self._cancel_grace_until = time.time() + 2.0
                                     await self._safe_cancel_lighter(self._pending)
-                                    await self._wait_orders_cleared(2.0)
-                                    if (self._pending
-                                            and self._pending.filled_qty
-                                            <= self._pending.hedged_qty):
-                                        self._pending = None
+                                    close_cleared = await self._wait_orders_cleared(2.0)
+                                    if close_cleared:
+                                        if (self._pending
+                                                and self._pending.filled_qty
+                                                <= self._pending.hedged_qty):
+                                            self._pending = None
+                                    else:
+                                        self.logger.warning(
+                                            "[平仓] close maker 撤单未确认, "
+                                            "保留pending状态")
                                 else:
                                     if self.position_direction == "long_X_short_L":
                                         new_close_price = self._round_lighter_price(
