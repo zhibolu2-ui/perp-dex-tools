@@ -853,16 +853,22 @@ class TakerBot:
 
             t0 = time.time()
 
-            l_fill, x_fill = await asyncio.gather(
-                self._place_lighter_taker(l_side, qty, l_ref),
-                self._place_hotstuff_ioc(x_side, qty, x_ref),
-            )
+            x_fill = await self._place_hotstuff_ioc(x_side, qty, x_ref)
+            x_ok = x_fill is not None and x_fill > 0
+
+            if not x_ok:
+                total_ms = (time.time() - t0) * 1000
+                self.logger.warning(
+                    f"[开仓] Hotstuff未成交({total_ms:.0f}ms), 放弃")
+                return False
+
+            hedge_qty = x_fill
+            l_fill = await self._place_lighter_taker(l_side, hedge_qty, l_ref)
             total_ms = (time.time() - t0) * 1000
 
             l_ok = l_fill is not None and l_fill > 0
-            x_ok = x_fill is not None and x_fill > 0
 
-            if l_ok and x_ok:
+            if l_ok:
                 l_fill_price = self._last_lighter_avg_price or l_ref
                 h_fill_price = self._last_hotstuff_avg_price or x_ref
                 x_actual = h_fill_price
@@ -907,7 +913,7 @@ class TakerBot:
                 self._open_theoretical_spread = spread_bps
 
                 self.logger.info(
-                    f"[开仓成功] {total_ms:.0f}ms(并行) "
+                    f"[开仓成功] {total_ms:.0f}ms(顺序H→L) "
                     f"实际价差={actual_sp:.1f}bps({sp_q}) "
                     f"L_{l_side}={l_fill_price:.2f}x{l_fill} "
                     f"H_{x_side}={x_actual:.2f}x{x_fill} "
@@ -928,51 +934,14 @@ class TakerBot:
                 self._last_ladder_attempt = time.time()
 
                 fill_diff = abs(l_fill - x_fill)
-                if fill_diff > qty * Decimal("0.1"):
-                    excess = l_fill - x_fill
+                if fill_diff > hedge_qty * Decimal("0.1"):
                     self.logger.warning(
-                        f"[开仓] 双边成交量偏差! L={l_fill} H={x_fill} "
-                        f"Δ={fill_diff}, 回撤超出部分")
-                    if excess > 0:
-                        undo_side = "sell" if l_side == "buy" else "buy"
-                        self.logger.info(
-                            f"[开仓回撤] Lighter {undo_side} {excess}")
-                        undo_fill = await self._place_lighter_taker(
-                            undo_side, excess, l_ref)
-                        if not (undo_fill and undo_fill > 0):
-                            self.logger.error(
-                                "[开仓回撤] Lighter失败, 触发对账")
-                            self._force_reconcile = True
-                    elif excess < 0:
-                        undo_x_side = "sell" if x_side == "buy" else "buy"
-                        abs_excess = abs(excess)
-                        self.logger.info(
-                            f"[开仓回撤] Hotstuff {undo_x_side} {abs_excess}")
-                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                        undo_ref = (x_bid_now if undo_x_side == "sell"
-                                    else x_ask_now) or x_ref
-                        undo_fill = await self._place_hotstuff_ioc(
-                            undo_x_side, abs_excess, undo_ref)
-                        if not (undo_fill and undo_fill > 0):
-                            self.logger.error(
-                                "[开仓回撤] Hotstuff失败, 触发对账")
-                            self._force_reconcile = True
+                        f"[开仓] Lighter成交量偏差! L={l_fill} H={x_fill}")
+                    self._force_reconcile = True
 
                 return True
 
-            elif l_ok and not x_ok:
-                self.logger.error(
-                    f"[开仓] Hotstuff未成交, 回撤Lighter "
-                    f"{l_side}→{l_fill} ({total_ms:.0f}ms)")
-                undo_side = "sell" if l_side == "buy" else "buy"
-                undo_fill = await self._place_lighter_taker(
-                    undo_side, l_fill, l_ref)
-                if not (undo_fill and undo_fill > 0):
-                    self.logger.error("[开仓] Lighter 回撤失败! 触发对账")
-                    self._force_reconcile = True
-                return False
-
-            elif not l_ok and x_ok:
+            else:
                 self.logger.error(
                     f"[开仓] Lighter未成交, 回撤Hotstuff "
                     f"{x_side}→{x_fill} ({total_ms:.0f}ms)")
@@ -985,11 +954,6 @@ class TakerBot:
                 if not (undo_fill and undo_fill > 0):
                     self.logger.error("[开仓] Hotstuff 回撤失败! 触发对账")
                     self._force_reconcile = True
-                return False
-
-            else:
-                self.logger.warning(
-                    f"[开仓] 双边均未成交({total_ms:.0f}ms), 放弃")
                 return False
 
     async def _close_position(
@@ -1032,20 +996,32 @@ class TakerBot:
             close_qty = l1_qty
 
             self.logger.info(
-                f"[平仓] 并行: Lighter IOC {close_l_side} {close_qty} @ {l_ref}, "
-                f"Hotstuff IOC {close_x_side} {close_qty} @ {x_ref}")
+                f"[平仓] 顺序H→L: Hotstuff IOC {close_x_side} {close_qty} @ {x_ref}, "
+                f"然后 Lighter IOC {close_l_side} @ {l_ref}")
 
             t0 = time.time()
-            l_fill, x_fill = await asyncio.gather(
-                self._place_lighter_taker(close_l_side, close_qty, l_ref),
-                self._place_hotstuff_ioc(close_x_side, close_qty, x_ref),
-            )
+
+            x_fill = await self._place_hotstuff_ioc(close_x_side, close_qty, x_ref)
+            x_ok = x_fill is not None and x_fill > 0
+
+            if not x_ok:
+                total_ms = (time.time() - t0) * 1000
+                self.logger.warning(
+                    f"[平仓] Hotstuff未成交({total_ms:.0f}ms), 下次重试")
+                return False
+
+            hedge_qty = x_fill
+            ls_now = self.lighter_feed.snapshot if self.lighter_feed else None
+            if ls_now and ls_now.best_bid and ls_now.best_ask:
+                l_ref = (Decimal(str(ls_now.best_bid)) if close_l_side == "sell"
+                         else Decimal(str(ls_now.best_ask)))
+
+            l_fill = await self._place_lighter_taker(close_l_side, hedge_qty, l_ref)
             total_ms = (time.time() - t0) * 1000
 
             l_ok = l_fill is not None and l_fill > 0
-            x_ok = x_fill is not None and x_fill > 0
 
-            if l_ok and x_ok:
+            if l_ok:
                 l_fill_price = self._last_lighter_avg_price or l_ref
                 h_fill_price = self._last_hotstuff_avg_price or x_ref
                 x_actual = h_fill_price
@@ -1084,7 +1060,7 @@ class TakerBot:
                 })
 
                 self.logger.info(
-                    f"[平仓完成] {total_ms:.0f}ms(并行) "
+                    f"[平仓完成] {total_ms:.0f}ms(顺序H→L) "
                     f"净利={net_bps:+.2f}bps "
                     f"偏移:L={total_dev_l:+.2f}bps H={total_dev_h:+.2f}bps "
                     f"超额={self._open_excess_bps:+.2f}bps "
@@ -1104,54 +1080,12 @@ class TakerBot:
                 self._last_trade_time = time.time()
 
                 fill_diff = abs(l_fill - x_fill)
-                if fill_diff > close_qty * Decimal("0.1"):
-                    excess = l_fill - x_fill
+                if fill_diff > hedge_qty * Decimal("0.1"):
                     self.logger.warning(
-                        f"[平仓] 双边成交量偏差! L={l_fill} H={x_fill} "
-                        f"Δ={fill_diff}, 回撤超出部分")
-                    if excess > 0:
-                        undo_side = ("sell" if close_l_side == "buy"
-                                     else "buy")
-                        self.logger.info(
-                            f"[平仓回撤] Lighter {undo_side} {excess}")
-                        undo_fill = await self._place_lighter_taker(
-                            undo_side, excess, l_ref)
-                        if not (undo_fill and undo_fill > 0):
-                            self._force_reconcile = True
-                    elif excess < 0:
-                        undo_x_side = ("sell" if close_x_side == "buy"
-                                       else "buy")
-                        abs_excess = abs(excess)
-                        self.logger.info(
-                            f"[平仓回撤] Hotstuff {undo_x_side} {abs_excess}")
-                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                        undo_ref = (x_bid_now if undo_x_side == "sell"
-                                    else x_ask_now) or x_ref
-                        undo_fill = await self._place_hotstuff_ioc(
-                            undo_x_side, abs_excess, undo_ref)
-                        if not (undo_fill and undo_fill > 0):
-                            self._force_reconcile = True
-
-            elif l_ok and not x_ok:
-                self.logger.error(
-                    f"[平仓] Hotstuff未成交, 回撤Lighter "
-                    f"{close_l_side}→{l_fill} ({total_ms:.0f}ms)")
-                undo_side = "sell" if close_l_side == "buy" else "buy"
-                ls = self.lighter_feed.snapshot if self.lighter_feed else None
-                undo_ref = l_ref
-                if ls and ls.mid:
-                    undo_ref_val = (
-                        (ls.best_bid or ls.mid) if undo_side == "sell"
-                        else (ls.best_ask or ls.mid))
-                    undo_ref = Decimal(str(undo_ref_val or l_ref))
-                undo_fill = await self._place_lighter_taker(
-                    undo_side, l_fill, undo_ref)
-                if not (undo_fill and undo_fill > 0):
-                    self.logger.error("[平仓] Lighter 回撤失败! 触发对账")
+                        f"[平仓] Lighter成交量偏差! L={l_fill} H={x_fill}")
                     self._force_reconcile = True
-                return False
 
-            elif not l_ok and x_ok:
+            else:
                 self.logger.error(
                     f"[平仓] Lighter未成交, 回撤Hotstuff "
                     f"{close_x_side}→{x_fill} ({total_ms:.0f}ms)")
@@ -1164,11 +1098,6 @@ class TakerBot:
                 if not (undo_fill and undo_fill > 0):
                     self.logger.error("[平仓] Hotstuff 回撤失败! 触发对账")
                     self._force_reconcile = True
-                return False
-
-            else:
-                self.logger.warning(
-                    f"[平仓] 双边均未成交({total_ms:.0f}ms), 下次重试")
                 return False
 
             pos_remaining = abs(self.hotstuff_position)
