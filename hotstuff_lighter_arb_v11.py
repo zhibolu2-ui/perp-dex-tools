@@ -266,10 +266,16 @@ class TakerBot:
         if not pk:
             raise ValueError("HOTSTUFF_PRIVATE_KEY not set")
         wallet = Account.from_key(pk)
-        self.hs_address = wallet.address
+        api_wallet_addr = wallet.address
+        self.hs_address = os.getenv("HOTSTUFF_ADDRESS", api_wallet_addr)
         self.hs_exchange = ExchangeClient(wallet=wallet)
         self.hs_info = InfoClient()
-        self.logger.info(f"Hotstuff client 已初始化  address={self.hs_address}")
+        if self.hs_address.lower() != api_wallet_addr.lower():
+            self.logger.info(
+                f"Hotstuff client 已初始化  主钱包={self.hs_address}  "
+                f"API钱包={api_wallet_addr}")
+        else:
+            self.logger.info(f"Hotstuff client 已初始化  address={self.hs_address}")
 
     def _get_hotstuff_instrument_info(self):
         from hotstuff.methods.info.market import InstrumentsParams
