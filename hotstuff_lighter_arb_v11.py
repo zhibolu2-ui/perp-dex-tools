@@ -485,7 +485,7 @@ class TakerBot:
         self._last_hotstuff_avg_price = None
 
         if self._fills_api_broken:
-            self._use_fallback_price(fallback, is_close)
+            await self._use_fallback_price(fallback, is_close)
             return
 
         from hotstuff.methods.info.account import FillsParams
@@ -635,7 +635,23 @@ class TakerBot:
         await self._use_fallback_price(fallback, is_close)
 
     async def _use_fallback_price(self, fallback: Decimal, is_close: bool):
-        """Use best available non-API price: BBO at fill time > entry price > ref."""
+        """Use best available non-API price.
+        Open: entry price (exact weighted avg) > BBO > ref
+        Close: BBO at fill time > ref
+        """
+        if not is_close:
+            entry_price = await self._get_hotstuff_entry_price()
+            if entry_price is not None and entry_price > 0:
+                diff = abs(float(
+                    (entry_price - fallback) / fallback * 10000
+                )) if fallback > 0 else 0
+                if diff < 100:
+                    self._last_hotstuff_avg_price = entry_price
+                    self.logger.info(
+                        f"[Hotstuff] 使用持仓均价: {entry_price:.2f} "
+                        f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
+                    return
+
         bbo_data = getattr(self, '_last_h_fill_bbo', None)
         if bbo_data:
             bid, ask, side = bbo_data
@@ -651,19 +667,6 @@ class TakerBot:
                     f"[Hotstuff] 使用成交时BBO bid: {bid:.2f} "
                     f"(ref={fallback:.2f})")
                 return
-
-        if not is_close:
-            entry_price = await self._get_hotstuff_entry_price()
-            if entry_price is not None and entry_price > 0:
-                diff = abs(float(
-                    (entry_price - fallback) / fallback * 10000
-                )) if fallback > 0 else 0
-                if diff < 100:
-                    self._last_hotstuff_avg_price = entry_price
-                    self.logger.info(
-                        f"[Hotstuff] 使用持仓均价: {entry_price:.2f} "
-                        f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
-                    return
 
         self._last_hotstuff_avg_price = fallback
         self.logger.warning(
