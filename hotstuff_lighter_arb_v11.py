@@ -473,9 +473,11 @@ class TakerBot:
 
     async def _fetch_hotstuff_fill_price(self, fallback: Decimal,
                                           max_attempts: int = 8,
-                                          delay: float = 0.4):
+                                          delay: float = 0.4,
+                                          is_close: bool = False):
         """Fetch actual fill price from Hotstuff fills API with robust retries.
         Should be called AFTER both legs complete (~1s after order) for reliability.
+        is_close=True prevents using entry price as backup (entry != close fill).
         """
         self._last_hotstuff_avg_price = None
         from hotstuff.methods.info.account import FillsParams
@@ -487,15 +489,15 @@ class TakerBot:
             self.logger.info(
                 f"[fills调试] FillsParams签名: {list(fp_params.keys())}")
 
-        params = None
-        for strategy in range(3):
-            kw = {}
-            if strategy <= 1:
-                for c in ("symbol", "instrument", "market", "pair"):
-                    if c in fp_params:
-                        kw[c] = self.hs_symbol
-                        break
-            if strategy == 0:
+        params_list = []
+        for page_val in (1, 0):
+            for strategy in range(3):
+                kw = {}
+                if strategy <= 1:
+                    for c in ("symbol", "instrument", "market", "pair"):
+                        if c in fp_params:
+                            kw[c] = self.hs_symbol
+                            break
                 for c in ("address", "user", "account"):
                     if c in fp_params:
                         kw[c] = self.hs_address
@@ -503,23 +505,25 @@ class TakerBot:
                 if "limit" in fp_params:
                     kw["limit"] = 10
                 if "page" in fp_params:
-                    kw["page"] = 1
-            elif strategy == 1:
-                for c in ("address", "user", "account"):
-                    if c in fp_params:
-                        kw[c] = self.hs_address
-                        break
-                if "page" in fp_params:
-                    kw["page"] = 1
-                if "limit" in fp_params:
-                    kw["limit"] = 10
-            try:
-                params = FillsParams(**kw)
+                    kw["page"] = page_val
+                if strategy == 2:
+                    kw = {}
+                    for c in ("address", "user", "account"):
+                        if c in fp_params:
+                            kw[c] = self.hs_address
+                            break
+                    if "page" in fp_params:
+                        kw["page"] = page_val
+                    if "limit" in fp_params:
+                        kw["limit"] = 10
+                try:
+                    params_list.append(FillsParams(**kw))
+                    break
+                except Exception:
+                    pass
+            if params_list:
                 break
-            except Exception as e:
-                self.logger.debug(
-                    f"[fills] 策略{strategy}({kw}): {e}")
-        if params is None:
+        if not params_list:
             self.logger.warning("[Hotstuff] FillsParams无法构造")
             self._last_hotstuff_avg_price = fallback
             return
@@ -528,22 +532,72 @@ class TakerBot:
         for attempt in range(max_attempts):
             if attempt > 0:
                 await asyncio.sleep(delay)
+            params = params_list[0]
             try:
                 resp = await loop.run_in_executor(
                     None, self.hs_info.fills, params)
+
+                raw_resp = resp
                 fills = (resp.fills if hasattr(resp, "fills")
                          else resp.get("fills", []) if isinstance(resp, dict)
                          else resp if isinstance(resp, list) else [])
 
-                if not hasattr(self, '_fills_struct_logged') and fills:
-                    self._fills_struct_logged = True
-                    f0 = fills[0]
-                    if isinstance(f0, dict):
-                        self.logger.info(
-                            f"[fills调试] fill字段: {list(f0.keys())}")
-                    else:
-                        attrs = [a for a in dir(f0) if not a.startswith('_')]
-                        self.logger.info(f"[fills调试] fill属性: {attrs}")
+                if attempt == 0 and not hasattr(self, '_fills_resp_logged'):
+                    self._fills_resp_logged = True
+                    rtype = type(raw_resp).__name__
+                    flen = len(fills) if fills else 0
+                    self.logger.info(
+                        f"[fills调试] resp类型={rtype} "
+                        f"fills数量={flen}")
+                    if fills and flen > 0:
+                        f0 = fills[0]
+                        if isinstance(f0, dict):
+                            self.logger.info(
+                                f"[fills调试] fill[0]字段: "
+                                f"{list(f0.keys())}")
+                            self.logger.info(
+                                f"[fills调试] fill[0]: "
+                                f"{dict(list(f0.items())[:8])}")
+                        else:
+                            attrs = [a for a in dir(f0)
+                                     if not a.startswith('_')]
+                            self.logger.info(
+                                f"[fills调试] fill[0]属性: {attrs}")
+                    elif flen == 0 and len(params_list) < 2:
+                        for pv in (0, 1, 2):
+                            try:
+                                kw2 = {}
+                                for c in ("address", "user", "account"):
+                                    if c in fp_params:
+                                        kw2[c] = self.hs_address
+                                        break
+                                if "page" in fp_params:
+                                    kw2["page"] = pv
+                                if "limit" in fp_params:
+                                    kw2["limit"] = 10
+                                p2 = FillsParams(**kw2)
+                                r2 = await loop.run_in_executor(
+                                    None, self.hs_info.fills, p2)
+                                f2 = (r2.fills if hasattr(r2, "fills")
+                                      else r2.get("fills", [])
+                                      if isinstance(r2, dict)
+                                      else r2 if isinstance(r2, list)
+                                      else [])
+                                self.logger.info(
+                                    f"[fills调试] page={pv} → "
+                                    f"{len(f2) if f2 else 0}条fills")
+                                if f2:
+                                    params_list = [p2]
+                                    fills = f2
+                                    f0 = fills[0]
+                                    if isinstance(f0, dict):
+                                        self.logger.info(
+                                            f"[fills调试] fill[0]: "
+                                            f"{dict(list(f0.items())[:8])}")
+                                    break
+                            except Exception as pe:
+                                self.logger.debug(
+                                    f"[fills调试] page={pv} 失败: {pe}")
 
                 if not fills:
                     continue
@@ -562,7 +616,8 @@ class TakerBot:
 
                 f = matching[0]
                 fill_id = None
-                for idf in ("id", "fillId", "fill_id", "tradeId", "trade_id"):
+                for idf in ("id", "fillId", "fill_id",
+                             "tradeId", "trade_id"):
                     fill_id = (f.get(idf) if isinstance(f, dict)
                                else getattr(f, idf, None))
                     if fill_id is not None:
@@ -572,8 +627,9 @@ class TakerBot:
                         continue
 
                 price = None
-                for pf in ("price", "fillPrice", "fill_price", "avgPrice",
-                           "avg_price", "executionPrice", "execution_price"):
+                for pf in ("price", "fillPrice", "fill_price",
+                           "avgPrice", "avg_price",
+                           "executionPrice", "execution_price"):
                     raw = (f.get(pf) if isinstance(f, dict)
                            else getattr(f, pf, None))
                     if raw is not None:
@@ -589,10 +645,6 @@ class TakerBot:
                         (price - fallback) / fallback * 10000
                     )) if fallback > 0 else 0
                     if diff_bps > 50:
-                        self.logger.warning(
-                            f"[Hotstuff] fills价格偏差过大 "
-                            f"fetched={price:.2f} ref={fallback:.2f} "
-                            f"diff={diff_bps:.1f}bps, 可能是旧fill")
                         if attempt < max_attempts - 1:
                             continue
                     self._last_hotstuff_avg_price = price
@@ -607,7 +659,7 @@ class TakerBot:
                 self.logger.debug(
                     f"[Hotstuff] fills API attempt {attempt+1}: {e}")
 
-        if not self._last_hotstuff_avg_price:
+        if not self._last_hotstuff_avg_price and not is_close:
             entry_price = await self._get_hotstuff_entry_price()
             if entry_price is not None and entry_price > 0:
                 diff = abs(float(
@@ -1205,7 +1257,7 @@ class TakerBot:
             l_ok = l_fill is not None and l_fill > 0
 
             if l_ok:
-                await self._fetch_hotstuff_fill_price(x_ref)
+                await self._fetch_hotstuff_fill_price(x_ref, is_close=True)
 
                 l_fill_price = self._last_lighter_avg_price or l_ref
                 h_fill_price = self._last_hotstuff_avg_price or x_ref
