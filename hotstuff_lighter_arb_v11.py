@@ -393,7 +393,7 @@ class TakerBot:
             self.logger.info(f"[Lighter] taker {side} {qty} ref={ref_price:.2f}")
 
             try:
-                await asyncio.wait_for(self._lighter_fill_event.wait(), timeout=0.35)
+                await asyncio.wait_for(self._lighter_fill_event.wait(), timeout=0.8)
             except asyncio.TimeoutError:
                 pass
 
@@ -469,6 +469,7 @@ class TakerBot:
     _last_hotstuff_avg_price: Optional[Decimal] = None
 
     _last_hs_fill_id: Optional[str] = None
+    _pre_close_entry: Optional[Decimal] = None
 
     async def _fetch_hotstuff_fill_price(self, fallback: Decimal,
                                           max_attempts: int = 8,
@@ -480,18 +481,43 @@ class TakerBot:
         from hotstuff.methods.info.account import FillsParams
         import inspect
         fp_params = inspect.signature(FillsParams).parameters
-        kw = {}
-        for candidate in ("symbol", "instrument", "market", "pair"):
-            if candidate in fp_params:
-                kw[candidate] = self.hs_symbol
+
+        if not hasattr(self, '_fills_debug_done'):
+            self._fills_debug_done = True
+            self.logger.info(
+                f"[fills调试] FillsParams签名: {list(fp_params.keys())}")
+
+        params = None
+        for strategy in range(3):
+            kw = {}
+            if strategy <= 1:
+                for c in ("symbol", "instrument", "market", "pair"):
+                    if c in fp_params:
+                        kw[c] = self.hs_symbol
+                        break
+            if strategy == 0:
+                for c in ("address", "user", "account"):
+                    if c in fp_params:
+                        kw[c] = self.hs_address
+                        break
+                if "limit" in fp_params:
+                    kw["limit"] = 10
+            elif strategy == 1:
+                for c in ("address", "user", "account"):
+                    if c in fp_params:
+                        kw[c] = self.hs_address
+                        break
+            try:
+                params = FillsParams(**kw)
                 break
-        for candidate in ("address", "user", "account"):
-            if candidate in fp_params:
-                kw[candidate] = self.hs_address
-                break
-        if "limit" in fp_params:
-            kw["limit"] = 10
-        params = FillsParams(**kw)
+            except Exception as e:
+                self.logger.debug(
+                    f"[fills] 策略{strategy}({kw}): {e}")
+        if params is None:
+            self.logger.warning("[Hotstuff] FillsParams无法构造")
+            self._last_hotstuff_avg_price = fallback
+            return
+
         loop = asyncio.get_event_loop()
         for attempt in range(max_attempts):
             if attempt > 0:
@@ -502,31 +528,72 @@ class TakerBot:
                 fills = (resp.fills if hasattr(resp, "fills")
                          else resp.get("fills", []) if isinstance(resp, dict)
                          else resp if isinstance(resp, list) else [])
+
+                if not hasattr(self, '_fills_struct_logged') and fills:
+                    self._fills_struct_logged = True
+                    f0 = fills[0]
+                    if isinstance(f0, dict):
+                        self.logger.info(
+                            f"[fills调试] fill字段: {list(f0.keys())}")
+                    else:
+                        attrs = [a for a in dir(f0) if not a.startswith('_')]
+                        self.logger.info(f"[fills调试] fill属性: {attrs}")
+
                 if not fills:
                     continue
-                f = fills[0]
-                fill_id = (f.get("id") if isinstance(f, dict)
-                           else getattr(f, "id", None))
+
+                matching = []
+                for ff in fills:
+                    inst = (ff.get("instrument") if isinstance(ff, dict)
+                            else getattr(ff, "instrument", None))
+                    sym = (ff.get("symbol") if isinstance(ff, dict)
+                           else getattr(ff, "symbol", None))
+                    if (inst == self.hs_symbol or sym == self.hs_symbol
+                            or (inst is None and sym is None)):
+                        matching.append(ff)
+                if not matching:
+                    matching = fills
+
+                f = matching[0]
+                fill_id = None
+                for idf in ("id", "fillId", "fill_id", "tradeId", "trade_id"):
+                    fill_id = (f.get(idf) if isinstance(f, dict)
+                               else getattr(f, idf, None))
+                    if fill_id is not None:
+                        break
                 if fill_id and fill_id == self._last_hs_fill_id:
                     if attempt < max_attempts - 1:
                         continue
-                price = (f.get("price") if isinstance(f, dict)
-                         else getattr(f, "price", None))
-                if price:
-                    fetched = Decimal(str(price))
-                    diff_bps = abs(float((fetched - fallback) / fallback * 10000)) if fallback > 0 else 0
+
+                price = None
+                for pf in ("price", "fillPrice", "fill_price", "avgPrice",
+                           "avg_price", "executionPrice", "execution_price"):
+                    raw = (f.get(pf) if isinstance(f, dict)
+                           else getattr(f, pf, None))
+                    if raw is not None:
+                        try:
+                            price = Decimal(str(raw))
+                            if price > 0:
+                                break
+                        except Exception:
+                            pass
+
+                if price and price > 0:
+                    diff_bps = abs(float(
+                        (price - fallback) / fallback * 10000
+                    )) if fallback > 0 else 0
                     if diff_bps > 50:
                         self.logger.warning(
                             f"[Hotstuff] fills价格偏差过大 "
-                            f"fetched={fetched:.2f} ref={fallback:.2f} "
+                            f"fetched={price:.2f} ref={fallback:.2f} "
                             f"diff={diff_bps:.1f}bps, 可能是旧fill")
                         if attempt < max_attempts - 1:
                             continue
-                    self._last_hotstuff_avg_price = fetched
+                    self._last_hotstuff_avg_price = price
                     if fill_id:
                         self._last_hs_fill_id = fill_id
                     self.logger.info(
-                        f"[Hotstuff] 成交价确认: {fetched:.2f} "
+                        f"[Hotstuff] 成交价确认: {price:.2f} "
                         f"(ref={fallback:.2f} 偏差={diff_bps:.1f}bps "
                         f"attempt={attempt+1})")
                     return
@@ -537,7 +604,9 @@ class TakerBot:
         if not self._last_hotstuff_avg_price:
             entry_price = await self._get_hotstuff_entry_price()
             if entry_price is not None and entry_price > 0:
-                diff = abs(float((entry_price - fallback) / fallback * 10000)) if fallback > 0 else 0
+                diff = abs(float(
+                    (entry_price - fallback) / fallback * 10000
+                )) if fallback > 0 else 0
                 if diff < 100:
                     self._last_hotstuff_avg_price = entry_price
                     self.logger.info(
@@ -546,9 +615,23 @@ class TakerBot:
                     return
 
         if not self._last_hotstuff_avg_price:
+            if self._pre_close_entry is not None:
+                self._last_hotstuff_avg_price = self._pre_close_entry
+                diff = abs(float(
+                    (self._pre_close_entry - fallback) / fallback * 10000
+                )) if fallback > 0 else 0
+                self.logger.info(
+                    f"[Hotstuff] 使用平仓前均价: "
+                    f"{self._pre_close_entry:.2f} "
+                    f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
+                self._pre_close_entry = None
+                return
+
+        if not self._last_hotstuff_avg_price:
             self._last_hotstuff_avg_price = fallback
             self.logger.warning(
-                f"[Hotstuff] ⚠ 无法获取实际成交价! 使用ref={fallback:.2f}(估算)")
+                f"[Hotstuff] ⚠ 无法获取实际成交价! "
+                f"使用ref={fallback:.2f}(估算)")
 
     async def _get_hotstuff_entry_price(self) -> Optional[Decimal]:
         """Extract entry/avg price from Hotstuff position as backup price source."""
@@ -1097,9 +1180,14 @@ class TakerBot:
                     f"(L1_L={l1_l} L1_H={l1_h})")
             close_qty = l1_qty
 
+            pre_entry = await self._get_hotstuff_entry_price()
+            if pre_entry and pre_entry > 0:
+                self._pre_close_entry = pre_entry
+
             self.logger.info(
                 f"[平仓] 顺序H→L: Hotstuff IOC {close_x_side} {close_qty} @ {x_ref}, "
-                f"然后 Lighter IOC {close_l_side} @ {l_ref}")
+                f"然后 Lighter IOC {close_l_side} @ {l_ref}"
+                + (f" 持仓均价={pre_entry:.2f}" if pre_entry else ""))
 
             t0 = time.time()
 
