@@ -515,12 +515,21 @@ class TakerBot:
             result = await loop.run_in_executor(
                 None, self.hs_exchange.place_order, params)
 
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            if not isinstance(result, dict):
+                result = {"raw": result}
+
             error = result.get("error", "")
             if error:
                 self.logger.error(f"[Hotstuff] IOC 失败: {error}")
                 return None
 
-            oid = result.get("data", {}).get("status", {}).get("oid")
+            oid = (result.get("data", {}) or {}).get("status", {})
+            if isinstance(oid, dict):
+                oid = oid.get("oid")
+            else:
+                oid = result.get("tx_hash", "unknown")
             self.logger.info(
                 f"[Hotstuff] IOC {side} {qty_r} ref={ref_price:.2f} "
                 f"oid={oid}")
@@ -680,7 +689,11 @@ class TakerBot:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, self.hs_exchange.cancel_all, params)
-            cancelled = result.get("data", {}).get("orders_cancelled", 0)
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            if not isinstance(result, dict):
+                result = {}
+            cancelled = (result.get("data", {}) or {}).get("orders_cancelled", 0)
             if cancelled:
                 self.logger.info(f"[Hotstuff] 撤销 {cancelled} 挂单")
         except Exception as e:
