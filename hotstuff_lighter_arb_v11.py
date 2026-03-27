@@ -502,11 +502,17 @@ class TakerBot:
                         break
                 if "limit" in fp_params:
                     kw["limit"] = 10
+                if "page" in fp_params:
+                    kw["page"] = 1
             elif strategy == 1:
                 for c in ("address", "user", "account"):
                     if c in fp_params:
                         kw[c] = self.hs_address
                         break
+                if "page" in fp_params:
+                    kw["page"] = 1
+                if "limit" in fp_params:
+                    kw["limit"] = 10
             try:
                 params = FillsParams(**kw)
                 break
@@ -613,19 +619,6 @@ class TakerBot:
                         f"[Hotstuff] 使用持仓均价: {entry_price:.2f} "
                         f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
                     return
-
-        if not self._last_hotstuff_avg_price:
-            if self._pre_close_entry is not None:
-                self._last_hotstuff_avg_price = self._pre_close_entry
-                diff = abs(float(
-                    (self._pre_close_entry - fallback) / fallback * 10000
-                )) if fallback > 0 else 0
-                self.logger.info(
-                    f"[Hotstuff] 使用平仓前均价: "
-                    f"{self._pre_close_entry:.2f} "
-                    f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
-                self._pre_close_entry = None
-                return
 
         if not self._last_hotstuff_avg_price:
             self._last_hotstuff_avg_price = fallback
