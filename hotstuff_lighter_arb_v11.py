@@ -929,10 +929,34 @@ class TakerBot:
 
                 fill_diff = abs(l_fill - x_fill)
                 if fill_diff > qty * Decimal("0.1"):
+                    excess = l_fill - x_fill
                     self.logger.warning(
                         f"[开仓] 双边成交量偏差! L={l_fill} H={x_fill} "
-                        f"Δ={fill_diff}, 触发对账")
-                    self._force_reconcile = True
+                        f"Δ={fill_diff}, 回撤超出部分")
+                    if excess > 0:
+                        undo_side = "sell" if l_side == "buy" else "buy"
+                        self.logger.info(
+                            f"[开仓回撤] Lighter {undo_side} {excess}")
+                        undo_fill = await self._place_lighter_taker(
+                            undo_side, excess, l_ref)
+                        if not (undo_fill and undo_fill > 0):
+                            self.logger.error(
+                                "[开仓回撤] Lighter失败, 触发对账")
+                            self._force_reconcile = True
+                    elif excess < 0:
+                        undo_x_side = "sell" if x_side == "buy" else "buy"
+                        abs_excess = abs(excess)
+                        self.logger.info(
+                            f"[开仓回撤] Hotstuff {undo_x_side} {abs_excess}")
+                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
+                        undo_ref = (x_bid_now if undo_x_side == "sell"
+                                    else x_ask_now) or x_ref
+                        undo_fill = await self._place_hotstuff_ioc(
+                            undo_x_side, abs_excess, undo_ref)
+                        if not (undo_fill and undo_fill > 0):
+                            self.logger.error(
+                                "[开仓回撤] Hotstuff失败, 触发对账")
+                            self._force_reconcile = True
 
                 return True
 
@@ -1081,10 +1105,32 @@ class TakerBot:
 
                 fill_diff = abs(l_fill - x_fill)
                 if fill_diff > close_qty * Decimal("0.1"):
+                    excess = l_fill - x_fill
                     self.logger.warning(
                         f"[平仓] 双边成交量偏差! L={l_fill} H={x_fill} "
-                        f"Δ={fill_diff}, 触发对账")
-                    self._force_reconcile = True
+                        f"Δ={fill_diff}, 回撤超出部分")
+                    if excess > 0:
+                        undo_side = ("sell" if close_l_side == "buy"
+                                     else "buy")
+                        self.logger.info(
+                            f"[平仓回撤] Lighter {undo_side} {excess}")
+                        undo_fill = await self._place_lighter_taker(
+                            undo_side, excess, l_ref)
+                        if not (undo_fill and undo_fill > 0):
+                            self._force_reconcile = True
+                    elif excess < 0:
+                        undo_x_side = ("sell" if close_x_side == "buy"
+                                       else "buy")
+                        abs_excess = abs(excess)
+                        self.logger.info(
+                            f"[平仓回撤] Hotstuff {undo_x_side} {abs_excess}")
+                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
+                        undo_ref = (x_bid_now if undo_x_side == "sell"
+                                    else x_ask_now) or x_ref
+                        undo_fill = await self._place_hotstuff_ioc(
+                            undo_x_side, abs_excess, undo_ref)
+                        if not (undo_fill and undo_fill > 0):
+                            self._force_reconcile = True
 
             elif l_ok and not x_ok:
                 self.logger.error(
