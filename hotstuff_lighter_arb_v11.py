@@ -635,42 +635,46 @@ class TakerBot:
         await self._use_fallback_price(fallback, is_close)
 
     async def _use_fallback_price(self, fallback: Decimal, is_close: bool):
-        """Use best available non-API price.
-        Open: entry price (exact weighted avg) > BBO > ref
-        Close: BBO at fill time > ref
+        """Best-effort price when fills API broken.
+        OPEN: entryPrice from position API = actual weighted fill.
+        CLOSE: BBO at REST-confirm time > ref.
         """
+        # ── OPEN: entryPrice IS the real fill price ──
         if not is_close:
+            await asyncio.sleep(0.05)
             entry_price = await self._get_hotstuff_entry_price()
             if entry_price is not None and entry_price > 0:
-                diff = abs(float(
+                diff_bps = abs(float(
                     (entry_price - fallback) / fallback * 10000
                 )) if fallback > 0 else 0
-                if diff < 100:
+                if diff_bps < 100:
                     self._last_hotstuff_avg_price = entry_price
                     self.logger.info(
-                        f"[Hotstuff] 使用持仓均价: {entry_price:.2f} "
-                        f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
+                        f"[Hotstuff] 持仓均价={entry_price:.2f} "
+                        f"(ref={fallback:.2f} 差={diff_bps:.1f}bps)")
                     return
+                self.logger.warning(
+                    f"[Hotstuff] 持仓均价偏差过大 {entry_price:.2f} "
+                    f"vs ref={fallback:.2f} ({diff_bps:.0f}bps)")
 
-        bbo_data = getattr(self, '_last_h_fill_bbo', None)
-        if bbo_data:
-            bid, ask, side = bbo_data
+        # ── CLOSE: BBO at REST confirm (ask for buy / bid for sell) ──
+        bbo = getattr(self, '_last_h_fill_bbo', None)
+        if bbo:
+            bid, ask, side = bbo
             if side == "buy" and ask and ask > 0:
                 self._last_hotstuff_avg_price = ask
                 self.logger.info(
-                    f"[Hotstuff] 使用成交时BBO ask: {ask:.2f} "
-                    f"(ref={fallback:.2f})")
+                    f"[Hotstuff] BBO ask={ask:.2f} (ref={fallback:.2f})")
                 return
-            elif side == "sell" and bid and bid > 0:
+            if side == "sell" and bid and bid > 0:
                 self._last_hotstuff_avg_price = bid
                 self.logger.info(
-                    f"[Hotstuff] 使用成交时BBO bid: {bid:.2f} "
-                    f"(ref={fallback:.2f})")
+                    f"[Hotstuff] BBO bid={bid:.2f} (ref={fallback:.2f})")
                 return
 
         self._last_hotstuff_avg_price = fallback
         self.logger.warning(
-            f"[Hotstuff] ⚠ 使用ref={fallback:.2f}(估算)")
+            f"[Hotstuff] ⚠ ref={fallback:.2f}(估算)")
 
     async def _get_hotstuff_entry_price(self) -> Optional[Decimal]:
         """Extract entry/avg price from Hotstuff position as backup price source."""
@@ -1186,20 +1190,36 @@ class TakerBot:
                             self._force_reconcile = True
                     elif excess_h > min_excess:
                         self.logger.warning(
-                            f"[开仓] H多成交{excess_h}, 回撤")
-                        undo_x_side = "sell" if x_side == "buy" else "buy"
-                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                        undo_x_ref = (x_bid_now if undo_x_side == "sell"
-                                      else x_ask_now) or x_ref
-                        undo = await self._place_hotstuff_ioc(
-                            undo_x_side, excess_h, undo_x_ref)
-                        if undo and undo > 0:
-                            if direction == "long_L_short_X":
-                                self.hotstuff_position += undo
-                            else:
-                                self.hotstuff_position -= undo
+                            f"[开仓] H多成交{excess_h}, L补仓(免费)")
+                        ls_now = (self.lighter_feed.snapshot
+                                  if self.lighter_feed else None)
+                        if ls_now and ls_now.best_bid and ls_now.best_ask:
+                            add_l_ref = (
+                                Decimal(str(ls_now.best_bid))
+                                if l_side == "sell"
+                                else Decimal(str(ls_now.best_ask)))
                         else:
-                            self._force_reconcile = True
+                            add_l_ref = l_ref
+                        add_ok = await self._place_lighter_taker(
+                            l_side, excess_h, add_l_ref)
+                        if not (add_ok and add_ok > 0):
+                            self.logger.warning(
+                                "[开仓] L补仓失败, 回撤H")
+                            undo_x_side = ("sell" if x_side == "buy"
+                                           else "buy")
+                            xb, xa = self._get_hotstuff_ws_bbo()
+                            undo_x_ref = (
+                                xb if undo_x_side == "sell"
+                                else xa) or x_ref
+                            undo = await self._place_hotstuff_ioc(
+                                undo_x_side, excess_h, undo_x_ref)
+                            if undo and undo > 0:
+                                if direction == "long_L_short_X":
+                                    self.hotstuff_position += undo
+                                else:
+                                    self.hotstuff_position -= undo
+                            else:
+                                self._force_reconcile = True
 
                 return True
 
@@ -1210,24 +1230,44 @@ class TakerBot:
                     self.hotstuff_position += x_fill
 
                 self.logger.error(
-                    f"[开仓] Lighter未成交, 回撤Hotstuff "
-                    f"{x_side}→{x_fill} ({total_ms:.0f}ms)")
-                undo_x_side = "sell" if x_side == "buy" else "buy"
-                x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                undo_x_ref = (x_bid_now if undo_x_side == "sell"
-                              else x_ask_now) or x_ref
-                undo_fill = await self._place_hotstuff_ioc(
-                    undo_x_side, x_fill, undo_x_ref)
-                if undo_fill and undo_fill > 0:
-                    if direction == "long_L_short_X":
-                        self.hotstuff_position += undo_fill
-                    else:
-                        self.hotstuff_position -= undo_fill
-                    self.logger.info(
-                        f"[开仓] Hotstuff 回撤成功 {undo_fill}")
+                    f"[开仓] Lighter未成交, 先尝试L对冲(免费) "
+                    f"{l_side} {x_fill} ({total_ms:.0f}ms)")
+                ls_now = (self.lighter_feed.snapshot
+                          if self.lighter_feed else None)
+                if ls_now and ls_now.best_bid and ls_now.best_ask:
+                    retry_ref = (
+                        Decimal(str(ls_now.best_bid))
+                        if l_side == "sell"
+                        else Decimal(str(ls_now.best_ask)))
                 else:
-                    self.logger.error("[开仓] Hotstuff 回撤失败! 触发对账")
-                    self._force_reconcile = True
+                    retry_ref = l_ref
+                l_retry = await self._place_lighter_taker(
+                    l_side, x_fill, retry_ref)
+                if l_retry and l_retry > 0:
+                    self.logger.info(
+                        f"[开仓] L对冲成功 {l_retry}")
+                else:
+                    self.logger.warning(
+                        "[开仓] L对冲也失败, 回撤H")
+                    undo_x_side = ("sell" if x_side == "buy"
+                                   else "buy")
+                    xb, xa = self._get_hotstuff_ws_bbo()
+                    undo_x_ref = (
+                        xb if undo_x_side == "sell"
+                        else xa) or x_ref
+                    undo_fill = await self._place_hotstuff_ioc(
+                        undo_x_side, x_fill, undo_x_ref)
+                    if undo_fill and undo_fill > 0:
+                        if direction == "long_L_short_X":
+                            self.hotstuff_position += undo_fill
+                        else:
+                            self.hotstuff_position -= undo_fill
+                        self.logger.info(
+                            f"[开仓] H回撤成功 {undo_fill}")
+                    else:
+                        self.logger.error(
+                            "[开仓] H回撤也失败! 触发对账")
+                        self._force_reconcile = True
                 return False
 
             elif l_ok and not x_ok:
@@ -1403,20 +1443,37 @@ class TakerBot:
                             self._force_reconcile = True
                     elif excess_h > min_excess:
                         self.logger.warning(
-                            f"[平仓] H多成交{excess_h}, 回撤")
-                        undo_x_side = "sell" if close_x_side == "buy" else "buy"
-                        x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                        undo_x_ref = (x_bid_now if undo_x_side == "sell"
-                                      else x_ask_now) or x_ref
-                        undo = await self._place_hotstuff_ioc(
-                            undo_x_side, excess_h, undo_x_ref)
-                        if undo and undo > 0:
-                            if close_x_side == "sell":
-                                self.hotstuff_position += undo
-                            else:
-                                self.hotstuff_position -= undo
+                            f"[平仓] H多成交{excess_h}, L补仓(免费)")
+                        ls_now = (self.lighter_feed.snapshot
+                                  if self.lighter_feed else None)
+                        if ls_now and ls_now.best_bid and ls_now.best_ask:
+                            add_l_ref = (
+                                Decimal(str(ls_now.best_bid))
+                                if close_l_side == "sell"
+                                else Decimal(str(ls_now.best_ask)))
                         else:
-                            self._force_reconcile = True
+                            add_l_ref = l_ref
+                        add_ok = await self._place_lighter_taker(
+                            close_l_side, excess_h, add_l_ref)
+                        if not (add_ok and add_ok > 0):
+                            self.logger.warning(
+                                "[平仓] L补仓失败, 回撤H")
+                            undo_x_side = ("sell"
+                                           if close_x_side == "buy"
+                                           else "buy")
+                            xb, xa = self._get_hotstuff_ws_bbo()
+                            undo_x_ref = (
+                                xb if undo_x_side == "sell"
+                                else xa) or x_ref
+                            undo = await self._place_hotstuff_ioc(
+                                undo_x_side, excess_h, undo_x_ref)
+                            if undo and undo > 0:
+                                if close_x_side == "sell":
+                                    self.hotstuff_position += undo
+                                else:
+                                    self.hotstuff_position -= undo
+                            else:
+                                self._force_reconcile = True
 
             elif x_ok and not l_ok:
                 if close_x_side == "sell":
@@ -1425,14 +1482,23 @@ class TakerBot:
                     self.hotstuff_position += x_fill
 
                 self.logger.error(
-                    f"[平仓] Lighter未成交, 回撤Hotstuff "
-                    f"{close_x_side}→{x_fill} ({total_ms:.0f}ms)")
-                undo_x_side = "sell" if close_x_side == "buy" else "buy"
-                x_bid_now, x_ask_now = self._get_hotstuff_ws_bbo()
-                undo_x_ref = (x_bid_now if undo_x_side == "sell"
-                              else x_ask_now) or x_ref
-                undo_fill = await self._place_hotstuff_ioc(
-                    undo_x_side, x_fill, undo_x_ref)
+                    f"[平仓] Lighter未成交, 先尝试L对冲(免费) "
+                    f"{close_l_side} {x_fill} ({total_ms:.0f}ms)")
+                ls_now = (self.lighter_feed.snapshot
+                          if self.lighter_feed else None)
+                if ls_now and ls_now.best_bid and ls_now.best_ask:
+                    retry_ref = (
+                        Decimal(str(ls_now.best_bid))
+                        if close_l_side == "sell"
+                        else Decimal(str(ls_now.best_ask)))
+                else:
+                    retry_ref = l_ref
+                l_retry = await self._place_lighter_taker(
+                    close_l_side, x_fill, retry_ref)
+                if l_retry and l_retry > 0:
+                    self.logger.info(
+                        f"[平仓] L对冲成功 {l_retry}")
+                    undo_fill = l_retry
                 if undo_fill and undo_fill > 0:
                     if close_x_side == "sell":
                         self.hotstuff_position += undo_fill
