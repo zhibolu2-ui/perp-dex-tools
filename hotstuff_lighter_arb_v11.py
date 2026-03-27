@@ -1498,17 +1498,28 @@ class TakerBot:
                 if l_retry and l_retry > 0:
                     self.logger.info(
                         f"[平仓] L对冲成功 {l_retry}")
-                    undo_fill = l_retry
-                if undo_fill and undo_fill > 0:
-                    if close_x_side == "sell":
-                        self.hotstuff_position += undo_fill
-                    else:
-                        self.hotstuff_position -= undo_fill
-                    self.logger.info(
-                        f"[平仓] Hotstuff 回撤成功 {undo_fill}")
                 else:
-                    self.logger.error("[平仓] Hotstuff 回撤失败! 触发对账")
-                    self._force_reconcile = True
+                    self.logger.warning(
+                        "[平仓] L对冲也失败, 回撤H")
+                    undo_x_side = ("sell" if close_x_side == "buy"
+                                   else "buy")
+                    xb, xa = self._get_hotstuff_ws_bbo()
+                    undo_x_ref = (
+                        xb if undo_x_side == "sell"
+                        else xa) or x_ref
+                    undo_fill = await self._place_hotstuff_ioc(
+                        undo_x_side, x_fill, undo_x_ref)
+                    if undo_fill and undo_fill > 0:
+                        if close_x_side == "sell":
+                            self.hotstuff_position += undo_fill
+                        else:
+                            self.hotstuff_position -= undo_fill
+                        self.logger.info(
+                            f"[平仓] H回撤成功 {undo_fill}")
+                    else:
+                        self.logger.error(
+                            "[平仓] H回撤也失败! 触发对账")
+                        self._force_reconcile = True
                 return False
 
             elif l_ok and not x_ok:
