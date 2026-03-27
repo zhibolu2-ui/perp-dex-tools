@@ -480,11 +480,17 @@ class TakerBot:
         from hotstuff.methods.info.account import FillsParams
         import inspect
         fp_params = inspect.signature(FillsParams).parameters
-        kw = {"symbol": self.hs_symbol, "limit": 10}
-        if "address" in fp_params:
-            kw["address"] = self.hs_address
-        elif "user" in fp_params:
-            kw["user"] = self.hs_address
+        kw = {}
+        for candidate in ("symbol", "instrument", "market", "pair"):
+            if candidate in fp_params:
+                kw[candidate] = self.hs_symbol
+                break
+        for candidate in ("address", "user", "account"):
+            if candidate in fp_params:
+                kw[candidate] = self.hs_address
+                break
+        if "limit" in fp_params:
+            kw["limit"] = 10
         params = FillsParams(**kw)
         loop = asyncio.get_event_loop()
         for attempt in range(max_attempts):
