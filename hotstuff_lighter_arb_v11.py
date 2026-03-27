@@ -426,12 +426,17 @@ class TakerBot:
                         delta = pre_pos - new_pos
                     if delta >= qty * Decimal("0.5"):
                         self.lighter_position = new_pos
+                        actual_qty = abs(delta)
                         if self._last_lighter_avg_price is None:
                             self._last_lighter_avg_price = ref_price
-                        actual_qty = abs(delta)
-                        self.logger.info(
-                            f"[Lighter] REST成交确认(第{attempt+1}次): "
-                            f"pos {pre_pos} → {new_pos} Δ={actual_qty}")
+                            self.logger.warning(
+                                f"[Lighter] REST成交确认(第{attempt+1}次): "
+                                f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
+                                f" 价格使用ref={ref_price:.2f}(估)")
+                        else:
+                            self.logger.info(
+                                f"[Lighter] REST成交确认(第{attempt+1}次): "
+                                f"pos {pre_pos} → {new_pos} Δ={actual_qty}")
                         return actual_qty
                 except Exception as e:
                     self.logger.warning(f"[Lighter] 验证失败: {e}")
@@ -465,22 +470,26 @@ class TakerBot:
 
     _last_hs_fill_id: Optional[str] = None
 
-    async def _fetch_hotstuff_fill_price(self, fallback: Decimal):
-        """Fetch the actual fill price from Hotstuff fills API with retries."""
+    async def _fetch_hotstuff_fill_price(self, fallback: Decimal,
+                                          max_attempts: int = 8,
+                                          delay: float = 0.4):
+        """Fetch actual fill price from Hotstuff fills API with robust retries.
+        Should be called AFTER both legs complete (~1s after order) for reliability.
+        """
         self._last_hotstuff_avg_price = None
         from hotstuff.methods.info.account import FillsParams
         import inspect
         fp_params = inspect.signature(FillsParams).parameters
-        kw = {"symbol": self.hs_symbol, "limit": 5}
+        kw = {"symbol": self.hs_symbol, "limit": 10}
         if "address" in fp_params:
             kw["address"] = self.hs_address
         elif "user" in fp_params:
             kw["user"] = self.hs_address
         params = FillsParams(**kw)
         loop = asyncio.get_event_loop()
-        for attempt in range(4):
+        for attempt in range(max_attempts):
             if attempt > 0:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(delay)
             try:
                 resp = await loop.run_in_executor(
                     None, self.hs_info.fills, params)
@@ -492,22 +501,86 @@ class TakerBot:
                 f = fills[0]
                 fill_id = (f.get("id") if isinstance(f, dict)
                            else getattr(f, "id", None))
-                if fill_id and fill_id == self._last_hs_fill_id and attempt < 3:
-                    continue
+                if fill_id and fill_id == self._last_hs_fill_id:
+                    if attempt < max_attempts - 1:
+                        continue
                 price = (f.get("price") if isinstance(f, dict)
                          else getattr(f, "price", None))
                 if price:
-                    self._last_hotstuff_avg_price = Decimal(str(price))
+                    fetched = Decimal(str(price))
+                    diff_bps = abs(float((fetched - fallback) / fallback * 10000)) if fallback > 0 else 0
+                    if diff_bps > 50:
+                        self.logger.warning(
+                            f"[Hotstuff] fills价格偏差过大 "
+                            f"fetched={fetched:.2f} ref={fallback:.2f} "
+                            f"diff={diff_bps:.1f}bps, 可能是旧fill")
+                        if attempt < max_attempts - 1:
+                            continue
+                    self._last_hotstuff_avg_price = fetched
                     if fill_id:
                         self._last_hs_fill_id = fill_id
+                    self.logger.info(
+                        f"[Hotstuff] 成交价确认: {fetched:.2f} "
+                        f"(ref={fallback:.2f} 偏差={diff_bps:.1f}bps "
+                        f"attempt={attempt+1})")
                     return
             except Exception as e:
                 self.logger.debug(
                     f"[Hotstuff] fills API attempt {attempt+1}: {e}")
+
+        if not self._last_hotstuff_avg_price:
+            entry_price = await self._get_hotstuff_entry_price()
+            if entry_price is not None and entry_price > 0:
+                diff = abs(float((entry_price - fallback) / fallback * 10000)) if fallback > 0 else 0
+                if diff < 100:
+                    self._last_hotstuff_avg_price = entry_price
+                    self.logger.info(
+                        f"[Hotstuff] 使用持仓均价: {entry_price:.2f} "
+                        f"(ref={fallback:.2f} 偏差={diff:.1f}bps)")
+                    return
+
         if not self._last_hotstuff_avg_price:
             self._last_hotstuff_avg_price = fallback
             self.logger.warning(
-                f"[Hotstuff] 无法获取实际成交价, 使用ref={fallback:.2f}(估算)")
+                f"[Hotstuff] ⚠ 无法获取实际成交价! 使用ref={fallback:.2f}(估算)")
+
+    async def _get_hotstuff_entry_price(self) -> Optional[Decimal]:
+        """Extract entry/avg price from Hotstuff position as backup price source."""
+        try:
+            loop = asyncio.get_event_loop()
+            positions = await loop.run_in_executor(
+                None,
+                self.hs_info.positions,
+                PositionsParams(user=self.hs_address),
+            )
+            if not positions:
+                return None
+            for p in positions:
+                inst = (p.get("instrument") if isinstance(p, dict)
+                        else getattr(p, "instrument", None))
+                if inst == self.hs_symbol:
+                    for field in ("entryPrice", "avgEntryPrice", "avgPrice",
+                                  "entry_price", "avg_entry_price",
+                                  "averagePrice", "average_price"):
+                        val = (p.get(field) if isinstance(p, dict)
+                               else getattr(p, field, None))
+                        if val is not None:
+                            try:
+                                price = Decimal(str(val))
+                                if price > 0:
+                                    return price
+                            except Exception:
+                                pass
+                    if not hasattr(self, '_logged_pos_fields'):
+                        self._logged_pos_fields = True
+                        keys = (list(p.keys()) if isinstance(p, dict)
+                                else [k for k in dir(p)
+                                      if not k.startswith('_')])
+                        self.logger.info(
+                            f"[DEBUG] Position对象字段: {keys}")
+                    return None
+        except Exception:
+            return None
 
     async def _place_hotstuff_ioc(self, side: str, qty: Decimal,
                                    ref_price: Decimal) -> Optional[Decimal]:
@@ -574,15 +647,10 @@ class TakerBot:
                     delta = pre_pos - new_pos
                 if delta > 0:
                     actual_qty = abs(delta)
-                    try:
-                        await self._fetch_hotstuff_fill_price(ref_price)
-                    except Exception as fp_err:
-                        self.logger.debug(f"[Hotstuff] fill price fetch: {fp_err}")
-                        self._last_hotstuff_avg_price = ref_price
+                    self._last_hotstuff_avg_price = None
                     self.logger.info(
                         f"[Hotstuff] REST确认成交: "
-                        f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
-                        f" fill={self._last_hotstuff_avg_price}")
+                        f"pos {pre_pos} → {new_pos} Δ={actual_qty}")
                     return actual_qty
                 else:
                     for attempt, delay in enumerate(delays):
@@ -594,16 +662,10 @@ class TakerBot:
                             delta = pre_pos - new_pos
                         if delta > 0:
                             actual_qty = abs(delta)
-                            try:
-                                await self._fetch_hotstuff_fill_price(ref_price)
-                            except Exception as fp_err:
-                                self.logger.debug(
-                                    f"[Hotstuff] fill price fetch: {fp_err}")
-                                self._last_hotstuff_avg_price = ref_price
+                            self._last_hotstuff_avg_price = None
                             self.logger.info(
                                 f"[Hotstuff] REST确认成交(第{attempt+2}次): "
-                                f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
-                                f" fill={self._last_hotstuff_avg_price}")
+                                f"pos {pre_pos} → {new_pos} Δ={actual_qty}")
                             return actual_qty
                     self.logger.warning("[Hotstuff] IOC 未确认成交")
                     return None
@@ -898,8 +960,12 @@ class TakerBot:
             l_ok = l_fill is not None and l_fill > 0
 
             if l_ok:
+                await self._fetch_hotstuff_fill_price(x_ref)
+
                 l_fill_price = self._last_lighter_avg_price or l_ref
                 h_fill_price = self._last_hotstuff_avg_price or x_ref
+                h_estimated = (self._last_hotstuff_avg_price is None
+                               or self._last_hotstuff_avg_price == x_ref)
                 x_actual = h_fill_price
 
                 if direction == "long_L_short_X":
@@ -940,12 +1006,13 @@ class TakerBot:
                 self._open_dev_h_bps = dev_h
                 self._open_excess_bps = excess
                 self._open_theoretical_spread = spread_bps
+                est_tag = "(估)" if h_estimated else ""
 
                 self.logger.info(
                     f"[开仓成功] {total_ms:.0f}ms(顺序H→L) "
                     f"实际价差={actual_sp:.1f}bps({sp_q}) "
                     f"L_{l_side}={l_fill_price:.2f}x{l_fill} "
-                    f"H_{x_side}={x_actual:.2f}x{x_fill} "
+                    f"H_{x_side}={x_actual:.2f}{est_tag}x{x_fill} "
                     f"偏移:L={dev_l:+.2f}bps H={dev_h:+.2f}bps "
                     f"超额={excess:+.2f}bps")
 
@@ -1051,8 +1118,12 @@ class TakerBot:
             l_ok = l_fill is not None and l_fill > 0
 
             if l_ok:
+                await self._fetch_hotstuff_fill_price(x_ref)
+
                 l_fill_price = self._last_lighter_avg_price or l_ref
                 h_fill_price = self._last_hotstuff_avg_price or x_ref
+                h_estimated = (self._last_hotstuff_avg_price is None
+                               or self._last_hotstuff_avg_price == x_ref)
                 x_actual = h_fill_price
 
                 if close_x_side == "sell":
@@ -1088,9 +1159,11 @@ class TakerBot:
                     "spread_open": self._open_theoretical_spread,
                 })
 
+                est_tag = "(估)" if h_estimated else ""
                 self.logger.info(
                     f"[平仓完成] {total_ms:.0f}ms(顺序H→L) "
-                    f"净利={net_bps:+.2f}bps "
+                    f"净利={net_bps:+.2f}bps{est_tag} "
+                    f"H_close={x_actual:.2f}{est_tag} L_close={l_fill_price:.2f} "
                     f"偏移:L={total_dev_l:+.2f}bps H={total_dev_h:+.2f}bps "
                     f"超额={self._open_excess_bps:+.2f}bps "
                     f"实际={actual_net:+.2f}bps "
