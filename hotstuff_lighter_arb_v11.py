@@ -463,27 +463,48 @@ class TakerBot:
 
     _last_hotstuff_avg_price: Optional[Decimal] = None
 
+    _last_hs_fill_id: Optional[str] = None
+
     async def _fetch_hotstuff_fill_price(self, fallback: Decimal):
-        """Fetch the most recent fill price from Hotstuff fills API."""
-        self._last_hotstuff_avg_price = fallback
-        try:
-            from hotstuff.methods.info.account import FillsParams
-            params = FillsParams(
-                address=self.hs_address,
-                symbol=self.hs_symbol,
-                limit=1,
-            )
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(
-                None, self.hs_info.fills, params)
-            fills = resp.fills if hasattr(resp, "fills") else resp.get("fills", [])
-            if fills:
+        """Fetch the actual fill price from Hotstuff fills API with retries."""
+        self._last_hotstuff_avg_price = None
+        from hotstuff.methods.info.account import FillsParams
+        params = FillsParams(
+            address=self.hs_address,
+            symbol=self.hs_symbol,
+            limit=5,
+        )
+        loop = asyncio.get_event_loop()
+        for attempt in range(4):
+            if attempt > 0:
+                await asyncio.sleep(0.15)
+            try:
+                resp = await loop.run_in_executor(
+                    None, self.hs_info.fills, params)
+                fills = (resp.fills if hasattr(resp, "fills")
+                         else resp.get("fills", []) if isinstance(resp, dict)
+                         else resp if isinstance(resp, list) else [])
+                if not fills:
+                    continue
                 f = fills[0]
-                price = f.price if hasattr(f, "price") else f.get("price")
+                fill_id = (f.get("id") if isinstance(f, dict)
+                           else getattr(f, "id", None))
+                if fill_id and fill_id == self._last_hs_fill_id and attempt < 3:
+                    continue
+                price = (f.get("price") if isinstance(f, dict)
+                         else getattr(f, "price", None))
                 if price:
                     self._last_hotstuff_avg_price = Decimal(str(price))
-        except Exception as e:
-            self.logger.debug(f"[Hotstuff] fills API error: {e}")
+                    if fill_id:
+                        self._last_hs_fill_id = fill_id
+                    return
+            except Exception as e:
+                self.logger.debug(
+                    f"[Hotstuff] fills API attempt {attempt+1}: {e}")
+        if not self._last_hotstuff_avg_price:
+            self._last_hotstuff_avg_price = fallback
+            self.logger.warning(
+                f"[Hotstuff] 无法获取实际成交价, 使用ref={fallback:.2f}(估算)")
 
     async def _place_hotstuff_ioc(self, side: str, qty: Decimal,
                                    ref_price: Decimal) -> Optional[Decimal]:
@@ -551,8 +572,6 @@ class TakerBot:
                 if delta > 0:
                     actual_qty = abs(delta)
                     await self._fetch_hotstuff_fill_price(ref_price)
-                    if not self._last_hotstuff_avg_price:
-                        self._last_hotstuff_avg_price = ref_price
                     self.logger.info(
                         f"[Hotstuff] REST确认成交: "
                         f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
@@ -569,8 +588,6 @@ class TakerBot:
                         if delta > 0:
                             actual_qty = abs(delta)
                             await self._fetch_hotstuff_fill_price(ref_price)
-                            if not self._last_hotstuff_avg_price:
-                                self._last_hotstuff_avg_price = ref_price
                             self.logger.info(
                                 f"[Hotstuff] REST确认成交(第{attempt+2}次): "
                                 f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
