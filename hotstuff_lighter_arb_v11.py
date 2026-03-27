@@ -538,42 +538,39 @@ class TakerBot:
                 f"[Hotstuff] IOC {side} {qty_r} ref={ref_price:.2f} "
                 f"oid={oid}")
 
-            tx_hash = result.get("tx_hash", "")
-            if tx_hash and not error:
-                await self._fetch_hotstuff_fill_price(ref_price)
-                if not self._last_hotstuff_avg_price:
-                    self._last_hotstuff_avg_price = ref_price
-                self.logger.info(
-                    f"[Hotstuff] 链上确认: tx={tx_hash[:18]}.. "
-                    f"fill={self._last_hotstuff_avg_price}")
-                return qty_r
-
-            await asyncio.sleep(0.05)
+            has_tx = bool(result.get("tx_hash", ""))
+            initial_wait = 0.02 if has_tx else 0.08
+            await asyncio.sleep(initial_wait)
             try:
+                delays = [0.1, 0.2, 0.3] if not has_tx else [0.08, 0.15]
                 new_pos = await self._get_hotstuff_position()
                 if side == "buy":
                     delta = new_pos - pre_pos
                 else:
                     delta = pre_pos - new_pos
-                if delta >= qty_r * Decimal("0.5"):
+                if delta > 0:
                     actual_qty = abs(delta)
                     await self._fetch_hotstuff_fill_price(ref_price)
+                    if not self._last_hotstuff_avg_price:
+                        self._last_hotstuff_avg_price = ref_price
                     self.logger.info(
                         f"[Hotstuff] REST确认成交: "
                         f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
                         f" fill={self._last_hotstuff_avg_price}")
                     return actual_qty
                 else:
-                    for attempt, delay in enumerate([0.1, 0.2]):
+                    for attempt, delay in enumerate(delays):
                         await asyncio.sleep(delay)
                         new_pos = await self._get_hotstuff_position()
                         if side == "buy":
                             delta = new_pos - pre_pos
                         else:
                             delta = pre_pos - new_pos
-                        if delta >= qty_r * Decimal("0.5"):
+                        if delta > 0:
                             actual_qty = abs(delta)
                             await self._fetch_hotstuff_fill_price(ref_price)
+                            if not self._last_hotstuff_avg_price:
+                                self._last_hotstuff_avg_price = ref_price
                             self.logger.info(
                                 f"[Hotstuff] REST确认成交(第{attempt+2}次): "
                                 f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
@@ -842,9 +839,11 @@ class TakerBot:
             l1_l, l1_h = self._get_l1_depth(l_side, x_side)
             l1_qty = min(qty, l1_l, l1_h)
             l1_qty = l1_qty.quantize(self.hs_lot_size, rounding=ROUND_DOWN)
-            if l1_qty <= 0:
+            min_trade = self.order_size * Decimal("0.05")
+            if l1_qty < min_trade:
                 self.logger.debug(
-                    f"[开仓] L1深度为零: L1_L={l1_l} L1_H={l1_h}, 跳过")
+                    f"[开仓] L1深度不足: L1_L={l1_l} L1_H={l1_h}"
+                    f" ({l1_qty}<{min_trade}), 跳过")
                 return False
             if l1_qty < qty:
                 self.logger.info(
@@ -993,9 +992,14 @@ class TakerBot:
             l1_l, l1_h = self._get_l1_depth(close_l_side, close_x_side)
             l1_qty = min(close_qty, l1_l, l1_h)
             l1_qty = l1_qty.quantize(self.hs_lot_size, rounding=ROUND_DOWN)
+            min_close = self.order_size * Decimal("0.05")
             if l1_qty <= 0:
                 self.logger.debug(
                     f"[平仓] L1深度为零, 等待")
+                return False
+            if l1_qty < min_close:
+                self.logger.debug(
+                    f"[平仓] L1深度太薄({l1_qty}<{min_close}), 等待")
                 return False
             if l1_qty < close_qty:
                 self.logger.info(
