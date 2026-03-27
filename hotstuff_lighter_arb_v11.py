@@ -268,12 +268,15 @@ class TakerBot:
         wallet = Account.from_key(pk)
         api_wallet_addr = wallet.address
         self.hs_address = os.getenv("HOTSTUFF_ADDRESS", api_wallet_addr)
+        self.hs_api_wallet_addr = api_wallet_addr
         self.hs_exchange = ExchangeClient(wallet=wallet)
         self.hs_info = InfoClient()
         is_agent = self.hs_address.lower() != api_wallet_addr.lower()
         self.logger.info(
             f"Hotstuff client 已初始化  "
-            f"{'agent模式' if is_agent else 'direct模式'}")
+            f"{'agent模式' if is_agent else 'direct模式'}"
+            f"  main={self.hs_address[:10]}…"
+            f"  api={api_wallet_addr[:10]}…")
 
     def _get_hotstuff_instrument_info(self):
         from hotstuff.methods.info.market import InstrumentsParams
@@ -469,135 +472,96 @@ class TakerBot:
     _last_hotstuff_avg_price: Optional[Decimal] = None
 
     _last_hs_fill_id: Optional[str] = None
-    _pre_close_entry: Optional[Decimal] = None
-
     async def _fetch_hotstuff_fill_price(self, fallback: Decimal,
                                           max_attempts: int = 8,
                                           delay: float = 0.4,
                                           is_close: bool = False):
-        """Fetch actual fill price from Hotstuff fills API with robust retries.
-        Should be called AFTER both legs complete (~1s after order) for reliability.
-        is_close=True prevents using entry price as backup (entry != close fill).
-        """
+        """Fetch actual fill price from Hotstuff fills API with robust retries."""
         self._last_hotstuff_avg_price = None
         from hotstuff.methods.info.account import FillsParams
         import inspect
         fp_params = inspect.signature(FillsParams).parameters
 
+        addr_key = None
+        for c in ("address", "user", "account"):
+            if c in fp_params:
+                addr_key = c
+                break
+
+        addrs_to_try = [self.hs_address]
+        if (hasattr(self, 'hs_api_wallet_addr')
+                and self.hs_api_wallet_addr.lower() != self.hs_address.lower()):
+            addrs_to_try.append(self.hs_api_wallet_addr)
+
         if not hasattr(self, '_fills_debug_done'):
             self._fills_debug_done = True
             self.logger.info(
-                f"[fills调试] FillsParams签名: {list(fp_params.keys())}")
+                f"[fills调试] FillsParams签名: {list(fp_params.keys())} "
+                f"addr_key={addr_key} "
+                f"尝试地址: main={self.hs_address[:10]}… "
+                f"api={getattr(self, 'hs_api_wallet_addr', '?')[:10]}…")
 
-        params_list = []
-        for page_val in (1, 0):
-            for strategy in range(3):
-                kw = {}
-                if strategy <= 1:
-                    for c in ("symbol", "instrument", "market", "pair"):
-                        if c in fp_params:
-                            kw[c] = self.hs_symbol
-                            break
-                for c in ("address", "user", "account"):
-                    if c in fp_params:
-                        kw[c] = self.hs_address
-                        break
-                if "limit" in fp_params:
-                    kw["limit"] = 10
-                if "page" in fp_params:
-                    kw["page"] = page_val
-                if strategy == 2:
-                    kw = {}
-                    for c in ("address", "user", "account"):
-                        if c in fp_params:
-                            kw[c] = self.hs_address
-                            break
-                    if "page" in fp_params:
-                        kw["page"] = page_val
-                    if "limit" in fp_params:
-                        kw["limit"] = 10
-                try:
-                    params_list.append(FillsParams(**kw))
-                    break
-                except Exception:
-                    pass
-            if params_list:
-                break
-        if not params_list:
-            self.logger.warning("[Hotstuff] FillsParams无法构造")
-            self._last_hotstuff_avg_price = fallback
-            return
+        def _build_params(addr, page_val):
+            kw = {}
+            if addr_key:
+                kw[addr_key] = addr
+            if "page" in fp_params:
+                kw["page"] = page_val
+            if "limit" in fp_params:
+                kw["limit"] = 10
+            return FillsParams(**kw)
 
+        working_params = None
         loop = asyncio.get_event_loop()
+
+        if not hasattr(self, '_fills_working_addr'):
+            for addr in addrs_to_try:
+                for pv in (0, 1):
+                    try:
+                        p = _build_params(addr, pv)
+                        r = await loop.run_in_executor(
+                            None, self.hs_info.fills, p)
+                        fills = (r.fills if hasattr(r, "fills")
+                                 else r.get("fills", []) if isinstance(r, dict)
+                                 else r if isinstance(r, list) else [])
+                        tag = "main" if addr == self.hs_address else "api"
+                        self.logger.info(
+                            f"[fills调试] {tag}地址 page={pv} → "
+                            f"{len(fills) if fills else 0}条fills")
+                        if fills:
+                            self._fills_working_addr = addr
+                            self._fills_working_page = pv
+                            working_params = p
+                            f0 = fills[0]
+                            if isinstance(f0, dict):
+                                self.logger.info(
+                                    f"[fills调试] fill[0]: "
+                                    f"{dict(list(f0.items())[:8])}")
+                            else:
+                                attrs = [a for a in dir(f0)
+                                         if not a.startswith('_')]
+                                self.logger.info(
+                                    f"[fills调试] fill[0]属性: {attrs}")
+                            break
+                    except Exception as pe:
+                        self.logger.debug(f"[fills调试] {addr[:10]}… page={pv}: {pe}")
+                if working_params:
+                    break
+
+        fills_addr = getattr(self, '_fills_working_addr', self.hs_address)
+        fills_page = getattr(self, '_fills_working_page', 0)
+
         for attempt in range(max_attempts):
             if attempt > 0:
                 await asyncio.sleep(delay)
-            params = params_list[0]
             try:
+                params = _build_params(fills_addr, fills_page)
                 resp = await loop.run_in_executor(
                     None, self.hs_info.fills, params)
 
-                raw_resp = resp
                 fills = (resp.fills if hasattr(resp, "fills")
                          else resp.get("fills", []) if isinstance(resp, dict)
                          else resp if isinstance(resp, list) else [])
-
-                if attempt == 0 and not hasattr(self, '_fills_resp_logged'):
-                    self._fills_resp_logged = True
-                    rtype = type(raw_resp).__name__
-                    flen = len(fills) if fills else 0
-                    self.logger.info(
-                        f"[fills调试] resp类型={rtype} "
-                        f"fills数量={flen}")
-                    if fills and flen > 0:
-                        f0 = fills[0]
-                        if isinstance(f0, dict):
-                            self.logger.info(
-                                f"[fills调试] fill[0]字段: "
-                                f"{list(f0.keys())}")
-                            self.logger.info(
-                                f"[fills调试] fill[0]: "
-                                f"{dict(list(f0.items())[:8])}")
-                        else:
-                            attrs = [a for a in dir(f0)
-                                     if not a.startswith('_')]
-                            self.logger.info(
-                                f"[fills调试] fill[0]属性: {attrs}")
-                    elif flen == 0 and len(params_list) < 2:
-                        for pv in (0, 1, 2):
-                            try:
-                                kw2 = {}
-                                for c in ("address", "user", "account"):
-                                    if c in fp_params:
-                                        kw2[c] = self.hs_address
-                                        break
-                                if "page" in fp_params:
-                                    kw2["page"] = pv
-                                if "limit" in fp_params:
-                                    kw2["limit"] = 10
-                                p2 = FillsParams(**kw2)
-                                r2 = await loop.run_in_executor(
-                                    None, self.hs_info.fills, p2)
-                                f2 = (r2.fills if hasattr(r2, "fills")
-                                      else r2.get("fills", [])
-                                      if isinstance(r2, dict)
-                                      else r2 if isinstance(r2, list)
-                                      else [])
-                                self.logger.info(
-                                    f"[fills调试] page={pv} → "
-                                    f"{len(f2) if f2 else 0}条fills")
-                                if f2:
-                                    params_list = [p2]
-                                    fills = f2
-                                    f0 = fills[0]
-                                    if isinstance(f0, dict):
-                                        self.logger.info(
-                                            f"[fills调试] fill[0]: "
-                                            f"{dict(list(f0.items())[:8])}")
-                                    break
-                            except Exception as pe:
-                                self.logger.debug(
-                                    f"[fills调试] page={pv} 失败: {pe}")
 
                 if not fills:
                     continue
@@ -1078,22 +1042,31 @@ class TakerBot:
 
             t0 = time.time()
 
-            x_fill = await self._place_hotstuff_ioc(x_side, qty, x_ref)
-            x_ok = x_fill is not None and x_fill > 0
+            results = await asyncio.gather(
+                self._place_hotstuff_ioc(x_side, qty, x_ref),
+                self._place_lighter_taker(l_side, qty, l_ref),
+                return_exceptions=True,
+            )
 
-            if not x_ok:
-                total_ms = (time.time() - t0) * 1000
-                self.logger.warning(
-                    f"[开仓] Hotstuff未成交({total_ms:.0f}ms), 放弃")
-                return False
+            x_fill = results[0] if not isinstance(results[0], Exception) else None
+            l_fill = results[1] if not isinstance(results[1], Exception) else None
+            if isinstance(results[0], Exception):
+                self.logger.error(f"[开仓] Hotstuff异常: {results[0]}")
+            if isinstance(results[1], Exception):
+                self.logger.error(f"[开仓] Lighter异常: {results[1]}")
 
-            hedge_qty = x_fill
-            l_fill = await self._place_lighter_taker(l_side, hedge_qty, l_ref)
             total_ms = (time.time() - t0) * 1000
-
+            x_ok = x_fill is not None and x_fill > 0
             l_ok = l_fill is not None and l_fill > 0
 
-            if l_ok:
+            if x_ok and l_ok:
+                hedge_qty = min(x_fill, l_fill)
+
+                if direction == "long_L_short_X":
+                    self.hotstuff_position -= x_fill
+                else:
+                    self.hotstuff_position += x_fill
+
                 await self._fetch_hotstuff_fill_price(x_ref)
 
                 l_fill_price = self._last_lighter_avg_price or l_ref
@@ -1101,11 +1074,6 @@ class TakerBot:
                 h_estimated = (self._last_hotstuff_avg_price is None
                                or self._last_hotstuff_avg_price == x_ref)
                 x_actual = h_fill_price
-
-                if direction == "long_L_short_X":
-                    self.hotstuff_position -= x_fill
-                else:
-                    self.hotstuff_position += x_fill
 
                 self._open_l_refs.append((l_fill_price, l_fill))
                 self._open_h_refs.append((x_actual, x_fill))
@@ -1143,7 +1111,7 @@ class TakerBot:
                 est_tag = "(估)" if h_estimated else ""
 
                 self.logger.info(
-                    f"[开仓成功] {total_ms:.0f}ms(顺序H→L) "
+                    f"[开仓成功] {total_ms:.0f}ms(并发) "
                     f"实际价差={actual_sp:.1f}bps({sp_q}) "
                     f"L_{l_side}={l_fill_price:.2f}x{l_fill} "
                     f"H_{x_side}={x_actual:.2f}{est_tag}x{x_fill} "
@@ -1166,12 +1134,17 @@ class TakerBot:
                 fill_diff = abs(l_fill - x_fill)
                 if fill_diff > hedge_qty * Decimal("0.1"):
                     self.logger.warning(
-                        f"[开仓] Lighter成交量偏差! L={l_fill} H={x_fill}")
+                        f"[开仓] 成交量偏差! L={l_fill} H={x_fill}, 触发对账")
                     self._force_reconcile = True
 
                 return True
 
-            else:
+            elif x_ok and not l_ok:
+                if direction == "long_L_short_X":
+                    self.hotstuff_position -= x_fill
+                else:
+                    self.hotstuff_position += x_fill
+
                 self.logger.error(
                     f"[开仓] Lighter未成交, 回撤Hotstuff "
                     f"{x_side}→{x_fill} ({total_ms:.0f}ms)")
@@ -1181,9 +1154,40 @@ class TakerBot:
                               else x_ask_now) or x_ref
                 undo_fill = await self._place_hotstuff_ioc(
                     undo_x_side, x_fill, undo_x_ref)
-                if not (undo_fill and undo_fill > 0):
+                if undo_fill and undo_fill > 0:
+                    if direction == "long_L_short_X":
+                        self.hotstuff_position += undo_fill
+                    else:
+                        self.hotstuff_position -= undo_fill
+                    self.logger.info(
+                        f"[开仓] Hotstuff 回撤成功 {undo_fill}")
+                else:
                     self.logger.error("[开仓] Hotstuff 回撤失败! 触发对账")
                     self._force_reconcile = True
+                return False
+
+            elif l_ok and not x_ok:
+                self.logger.error(
+                    f"[开仓] Hotstuff未成交, 回撤Lighter "
+                    f"{l_side}→{l_fill} ({total_ms:.0f}ms)")
+                undo_l_side = "sell" if l_side == "buy" else "buy"
+                ls_now = self.lighter_feed.snapshot if self.lighter_feed else None
+                if ls_now and ls_now.best_bid and ls_now.best_ask:
+                    undo_l_ref = (Decimal(str(ls_now.best_bid))
+                                  if undo_l_side == "sell"
+                                  else Decimal(str(ls_now.best_ask)))
+                else:
+                    undo_l_ref = l_ref
+                undo_fill = await self._place_lighter_taker(
+                    undo_l_side, l_fill, undo_l_ref)
+                if not (undo_fill and undo_fill > 0):
+                    self.logger.error("[开仓] Lighter 回撤失败! 触发对账")
+                    self._force_reconcile = True
+                return False
+
+            else:
+                self.logger.warning(
+                    f"[开仓] 两边都未成交 ({total_ms:.0f}ms)")
                 return False
 
     async def _close_position(
@@ -1225,38 +1229,32 @@ class TakerBot:
                     f"(L1_L={l1_l} L1_H={l1_h})")
             close_qty = l1_qty
 
-            pre_entry = await self._get_hotstuff_entry_price()
-            if pre_entry and pre_entry > 0:
-                self._pre_close_entry = pre_entry
-
             self.logger.info(
-                f"[平仓] 顺序H→L: Hotstuff IOC {close_x_side} {close_qty} @ {x_ref}, "
-                f"然后 Lighter IOC {close_l_side} @ {l_ref}"
-                + (f" 持仓均价={pre_entry:.2f}" if pre_entry else ""))
+                f"[平仓] 并发H+L: Hotstuff IOC {close_x_side} {close_qty} @ {x_ref}, "
+                f"Lighter IOC {close_l_side} @ {l_ref}")
 
             t0 = time.time()
 
-            x_fill = await self._place_hotstuff_ioc(close_x_side, close_qty, x_ref)
-            x_ok = x_fill is not None and x_fill > 0
+            results = await asyncio.gather(
+                self._place_hotstuff_ioc(close_x_side, close_qty, x_ref),
+                self._place_lighter_taker(close_l_side, close_qty, l_ref),
+                return_exceptions=True,
+            )
 
-            if not x_ok:
-                total_ms = (time.time() - t0) * 1000
-                self.logger.warning(
-                    f"[平仓] Hotstuff未成交({total_ms:.0f}ms), 下次重试")
-                return False
+            x_fill = results[0] if not isinstance(results[0], Exception) else None
+            l_fill = results[1] if not isinstance(results[1], Exception) else None
+            if isinstance(results[0], Exception):
+                self.logger.error(f"[平仓] Hotstuff异常: {results[0]}")
+            if isinstance(results[1], Exception):
+                self.logger.error(f"[平仓] Lighter异常: {results[1]}")
 
-            hedge_qty = x_fill
-            ls_now = self.lighter_feed.snapshot if self.lighter_feed else None
-            if ls_now and ls_now.best_bid and ls_now.best_ask:
-                l_ref = (Decimal(str(ls_now.best_bid)) if close_l_side == "sell"
-                         else Decimal(str(ls_now.best_ask)))
-
-            l_fill = await self._place_lighter_taker(close_l_side, hedge_qty, l_ref)
             total_ms = (time.time() - t0) * 1000
-
+            x_ok = x_fill is not None and x_fill > 0
             l_ok = l_fill is not None and l_fill > 0
 
-            if l_ok:
+            if x_ok and l_ok:
+                hedge_qty = min(x_fill, l_fill)
+
                 await self._fetch_hotstuff_fill_price(x_ref, is_close=True)
 
                 l_fill_price = self._last_lighter_avg_price or l_ref
@@ -1270,7 +1268,7 @@ class TakerBot:
                 else:
                     self.hotstuff_position += x_fill
 
-                net_bps = self._log_ref_pnl(x_actual, l_fill_price, l_fill)
+                net_bps = self._log_ref_pnl(x_actual, l_fill_price, hedge_qty)
                 self.cumulative_net_bps += net_bps
 
                 if close_l_side == "buy":
@@ -1300,7 +1298,7 @@ class TakerBot:
 
                 est_tag = "(估)" if h_estimated else ""
                 self.logger.info(
-                    f"[平仓完成] {total_ms:.0f}ms(顺序H→L) "
+                    f"[平仓完成] {total_ms:.0f}ms(并发) "
                     f"净利={net_bps:+.2f}bps{est_tag} "
                     f"H_close={x_actual:.2f}{est_tag} L_close={l_fill_price:.2f} "
                     f"偏移:L={total_dev_l:+.2f}bps H={total_dev_h:+.2f}bps "
@@ -1323,10 +1321,15 @@ class TakerBot:
                 fill_diff = abs(l_fill - x_fill)
                 if fill_diff > hedge_qty * Decimal("0.1"):
                     self.logger.warning(
-                        f"[平仓] Lighter成交量偏差! L={l_fill} H={x_fill}")
+                        f"[平仓] 成交量偏差! L={l_fill} H={x_fill}, 触发对账")
                     self._force_reconcile = True
 
-            else:
+            elif x_ok and not l_ok:
+                if close_x_side == "sell":
+                    self.hotstuff_position -= x_fill
+                else:
+                    self.hotstuff_position += x_fill
+
                 self.logger.error(
                     f"[平仓] Lighter未成交, 回撤Hotstuff "
                     f"{close_x_side}→{x_fill} ({total_ms:.0f}ms)")
@@ -1336,9 +1339,40 @@ class TakerBot:
                               else x_ask_now) or x_ref
                 undo_fill = await self._place_hotstuff_ioc(
                     undo_x_side, x_fill, undo_x_ref)
-                if not (undo_fill and undo_fill > 0):
+                if undo_fill and undo_fill > 0:
+                    if close_x_side == "sell":
+                        self.hotstuff_position += undo_fill
+                    else:
+                        self.hotstuff_position -= undo_fill
+                    self.logger.info(
+                        f"[平仓] Hotstuff 回撤成功 {undo_fill}")
+                else:
                     self.logger.error("[平仓] Hotstuff 回撤失败! 触发对账")
                     self._force_reconcile = True
+                return False
+
+            elif l_ok and not x_ok:
+                self.logger.error(
+                    f"[平仓] Hotstuff未成交, 回撤Lighter "
+                    f"{close_l_side}→{l_fill} ({total_ms:.0f}ms)")
+                undo_l_side = "sell" if close_l_side == "buy" else "buy"
+                ls_now = self.lighter_feed.snapshot if self.lighter_feed else None
+                if ls_now and ls_now.best_bid and ls_now.best_ask:
+                    undo_l_ref = (Decimal(str(ls_now.best_bid))
+                                  if undo_l_side == "sell"
+                                  else Decimal(str(ls_now.best_ask)))
+                else:
+                    undo_l_ref = l_ref
+                undo_fill = await self._place_lighter_taker(
+                    undo_l_side, l_fill, undo_l_ref)
+                if not (undo_fill and undo_fill > 0):
+                    self.logger.error("[平仓] Lighter 回撤失败! 触发对账")
+                    self._force_reconcile = True
+                return False
+
+            else:
+                self.logger.warning(
+                    f"[平仓] 两边都未成交 ({total_ms:.0f}ms)")
                 return False
 
             pos_remaining = abs(self.hotstuff_position)
