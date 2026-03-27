@@ -540,9 +540,12 @@ class TakerBot:
 
             tx_hash = result.get("tx_hash", "")
             if tx_hash and not error:
-                self._last_hotstuff_avg_price = Decimal(str(aggressive))
+                await self._fetch_hotstuff_fill_price(ref_price)
+                if not self._last_hotstuff_avg_price:
+                    self._last_hotstuff_avg_price = ref_price
                 self.logger.info(
-                    f"[Hotstuff] 链上确认: tx={tx_hash[:18]}.. fill={aggressive}")
+                    f"[Hotstuff] 链上确认: tx={tx_hash[:18]}.. "
+                    f"fill={self._last_hotstuff_avg_price}")
                 return qty_r
 
             await asyncio.sleep(0.05)
