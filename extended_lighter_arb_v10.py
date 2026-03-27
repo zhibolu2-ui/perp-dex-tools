@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Extended + Lighter 价差收敛套利 V9（Lighter Maker + Extended Taker 角色互换）
+Extended + Lighter 价差收敛套利 V10（基于V9, 平仓改为双边市价）
 
 策略：
   开仓: Lighter POST_ONLY maker 挂单（双边挂单），价格基于 Extended BBO 计算。
          被成交后 → Extended IOC taker 对冲。
-  平仓: 检测价差收敛 → Lighter maker 平仓挂单 → 成交后 Extended IOC taker 平仓。
+  平仓: 检测价差收敛 → Lighter IOC taker 市价平仓 + Extended IOC taker 市价平仓。
 
 费用: ~5.0 bps 往返 (Extended taker 2.5bps 开仓对冲 + Extended taker 2.5bps 平仓对冲)
       Lighter maker/taker 均 0% (Premium 账户 0 延迟下单)
 
-与 V8 的区别：
-  V8: Extended maker 开仓(0费) + Extended taker 平仓(2.5bps) = 2.5bps 往返
-      缺点: Extended maker 被成交后 Lighter taker 对冲有延迟(~400ms), 导致价差侵蚀
-  V9: Lighter maker 开仓(0费,0延迟) + Extended taker 对冲(2.5bps) = 5bps 往返
-      优点: Lighter Premium 0延迟下单, 对冲在 Extended 上执行(流动性好,延迟低)
+与 V9 的区别：
+  V9: 平仓使用 Lighter maker 挂单等待被吃单, 有延迟和孤儿订单风险
+  V10: 平仓使用 Lighter IOC taker 市价立即成交, 速度更快, 无孤儿风险
 
 用法:
-  python extended_lighter_arb_v9.py --symbol BTC --size 0.002 --target-spread 6
-  python extended_lighter_arb_v9.py --symbol ETH --dry-run
+  python extended_lighter_arb_v10.py --symbol BTC --size 0.002 --target-spread 6
+  python extended_lighter_arb_v10.py --symbol ETH --dry-run
 """
 
 from __future__ import annotations
@@ -178,6 +176,7 @@ class ExtMakerBot:
         self._post_close_cooldown: float = 30.0
         self._last_close_time: float = 0.0
         self._consecutive_losses: int = 0
+        self._loss_streak_limit: int = 3
         self._loss_breaker_until: float = 0.0
         self._loss_breaker_threshold: float = -15.0
         self._loss_breaker_duration: float = 300.0
@@ -193,8 +192,8 @@ class ExtMakerBot:
         self._min_modify_interval: float = 1.0
 
         os.makedirs("logs", exist_ok=True)
-        self.csv_path = f"logs/arb_v9_{self.symbol}_trades.csv"
-        self.log_path = f"logs/arb_v9_{self.symbol}.log"
+        self.csv_path = f"logs/arb_v10_{self.symbol}_trades.csv"
+        self.log_path = f"logs/arb_v10_{self.symbol}.log"
         self._init_csv()
         self.logger = self._init_logger()
 
@@ -690,7 +689,7 @@ class ExtMakerBot:
                             self._consecutive_losses += 1
                         else:
                             self._consecutive_losses = 0
-                        if (self._consecutive_losses >= 3
+                        if (self._consecutive_losses >= self._loss_streak_limit
                                 or self.cumulative_net_bps < self._loss_breaker_threshold):
                             self._loss_breaker_until = time.time() + self._loss_breaker_duration
                             self.logger.error(
@@ -1732,7 +1731,7 @@ class ExtMakerBot:
                        f"最多{int(self.max_position / self.order_size)}层"
                        if self.ladder_step > 0 else "阶梯=关")
         self.logger.info(
-            f"启动 V9 Lighter-Maker+Extended-Taker 套利  {self.symbol}  "
+            f"启动 V10 Lighter-Maker开仓+双边Taker平仓 套利  {self.symbol}  "
             f"size={self.order_size} max_pos={self.max_position}  "
             f"目标价差≥{self.target_spread}bps  "
             f"平仓价差≤{self.close_gap_bps}bps  "
@@ -2322,55 +2321,109 @@ class ExtMakerBot:
                                     if close_qty > 0:
                                         if self.position_direction == "long_X_short_L":
                                             close_l_side = "buy"
-                                            close_l_dir = "long_X_short_L"
-                                            close_price = self._round_lighter_price(
-                                                l_bid + self.lighter_tick)
+                                            close_x_side = "sell"
+                                            l_ref = l_ask if l_ask > 0 else l_mid
+                                            x_ref = x_ws_bid
                                         else:
                                             close_l_side = "sell"
-                                            close_l_dir = "long_L_short_X"
-                                            close_price = self._round_lighter_price(
-                                                l_ask - self.lighter_tick)
+                                            close_x_side = "buy"
+                                            l_ref = l_bid if l_bid > 0 else l_mid
+                                            x_ref = x_ws_ask
+
                                         self.logger.info(
-                                            f"[平仓] Lighter maker {close_l_side} "
-                                            f"{close_qty} @ {close_price}")
-                                        await self._update_maker(
-                                            close_l_side, close_l_dir,
-                                            close_price, close_qty, "close",
-                                            x_ws_bid if close_l_side == "buy" else x_ws_ask)
-                                        last_reconcile = time.time() - 50
-                            elif (self._pending.phase == "close"
-                                      and self._pending.filled_qty == 0):
-                                if not self._should_close_now(
-                                        l_bid, l_ask, x_ws_bid, x_ws_ask):
-                                    self.logger.info(
-                                        "[平仓] gap 已扩大, 取消 close maker 等待重新收敛")
-                                    self._cancel_grace_until = time.time() + 2.0
-                                    await self._safe_cancel_lighter(self._pending)
-                                    close_cleared = await self._wait_orders_cleared(2.0)
-                                    if close_cleared:
-                                        if (self._pending
-                                                and self._pending.filled_qty
-                                                <= self._pending.hedged_qty):
-                                            self._pending = None
-                                    else:
-                                        self.logger.warning(
-                                            "[平仓] close maker 撤单未确认, "
-                                            "保留pending状态")
-                                else:
-                                    if self.position_direction == "long_X_short_L":
-                                        new_close_price = self._round_lighter_price(
-                                            l_bid + self.lighter_tick)
-                                    else:
-                                        new_close_price = self._round_lighter_price(
-                                            l_ask - self.lighter_tick)
-                                    await self._update_maker(
-                                        self._pending.side,
-                                        self._pending.direction,
-                                        new_close_price,
-                                        abs(self.lighter_position),
-                                        "close",
-                                        x_ws_bid if self._pending.side == "buy"
-                                        else x_ws_ask)
+                                            f"[平仓] 双边市价: Lighter IOC {close_l_side} "
+                                            f"{close_qty} @ {l_ref}, Extended IOC "
+                                            f"{close_x_side} {close_qty} @ {x_ref}")
+
+                                        t0 = time.time()
+                                        l_fill = await self._place_lighter_taker(
+                                            close_l_side, close_qty, l_ref)
+                                        l_ms = (time.time() - t0) * 1000
+
+                                        if l_fill is not None and l_fill > 0:
+                                            if close_l_side == "buy":
+                                                self.lighter_position += l_fill
+                                            else:
+                                                self.lighter_position -= l_fill
+
+                                            l_fill_price = (
+                                                self._last_lighter_avg_price or l_ref)
+
+                                            t1 = time.time()
+                                            x_fill = await self._place_extended_ioc(
+                                                close_x_side, l_fill, x_ref)
+                                            x_ms = (time.time() - t1) * 1000
+
+                                            if x_fill is not None and x_fill > 0:
+                                                if close_x_side == "sell":
+                                                    self.extended_position -= x_fill
+                                                else:
+                                                    self.extended_position += x_fill
+                                                x_actual = (
+                                                    self._x_ioc_fill_price or x_ref)
+
+                                                net_bps = self._log_ref_pnl(
+                                                    x_actual, l_fill_price, l_fill)
+                                                self.cumulative_net_bps += net_bps
+                                                self.logger.info(
+                                                    f"[平仓完成] L={l_ms:.0f}ms "
+                                                    f"X={x_ms:.0f}ms "
+                                                    f"净利={net_bps:+.2f}bps "
+                                                    f"累积="
+                                                    f"{self.cumulative_net_bps:+.2f}bps")
+                                                self._csv_row([
+                                                    datetime.now(timezone.utc).isoformat(),
+                                                    "CLOSE", "convergence",
+                                                    close_l_side,
+                                                    f"{l_fill_price:.2f}",
+                                                    str(l_fill),
+                                                    close_x_side,
+                                                    f"{x_actual:.2f}",
+                                                    str(x_fill),
+                                                    f"{mid_spread_bps:.2f}",
+                                                    f"{l_ms + x_ms:.0f}",
+                                                    f"{net_bps:.2f}",
+                                                    f"{self.cumulative_net_bps:.2f}",
+                                                ])
+                                            else:
+                                                self.logger.error(
+                                                    "[平仓] Extended IOC 失败, "
+                                                    "触发对账")
+                                                self._force_reconcile = True
+
+                                            pos_remaining = abs(
+                                                self.extended_position)
+                                            if pos_remaining < (
+                                                    self.order_size
+                                                    * Decimal("0.01")):
+                                                self._last_close_time = time.time()
+                                                if net_bps < 0:
+                                                    self._consecutive_losses += 1
+                                                else:
+                                                    self._consecutive_losses = 0
+                                                if (self._consecutive_losses >= self._loss_streak_limit
+                                                        or self.cumulative_net_bps
+                                                        < self._loss_breaker_threshold):
+                                                    self._loss_breaker_until = (
+                                                        time.time()
+                                                        + self._loss_breaker_duration)
+                                                    self.logger.error(
+                                                        f"[熔断] 连亏="
+                                                        f"{self._consecutive_losses} "
+                                                        f"累积="
+                                                        f"{self.cumulative_net_bps:+.2f}"
+                                                        f"bps")
+                                                self._reset_position_state()
+                                                self.state = State.QUOTING
+                                            else:
+                                                self._normalize_refs(
+                                                    pos_remaining)
+                                                self.state = State.IN_POSITION
+                                            last_reconcile = time.time() - 50
+                                        else:
+                                            self.logger.warning(
+                                                "[平仓] Lighter IOC 未成交, "
+                                                "下次循环重试")
 
                 # ━━━━━━ STATE: CLOSING_HEDGE (Extended IOC 平仓对冲) ━━━━━━
                 elif self.state == State.CLOSING_HEDGE:
@@ -2438,7 +2491,7 @@ class ExtMakerBot:
                                         self._consecutive_losses += 1
                                     else:
                                         self._consecutive_losses = 0
-                                    if (self._consecutive_losses >= 3
+                                    if (self._consecutive_losses >= self._loss_streak_limit
                                             or self.cumulative_net_bps < self._loss_breaker_threshold):
                                         self._loss_breaker_until = (
                                             time.time() + self._loss_breaker_duration)
@@ -2547,6 +2600,8 @@ def main():
     p.add_argument("--cooldown", type=float, default=15.0)
     p.add_argument("--loss-breaker-bps", type=float, default=-15.0)
     p.add_argument("--loss-breaker-sec", type=float, default=300.0)
+    p.add_argument("--loss-streak", type=int, default=3,
+                   help="连续亏损多少次触发熔断 (默认3)")
     p.add_argument("--interval", type=float, default=0.1)
     p.add_argument("--reprice-interval", type=float, default=1.0,
                    help="最小调价间隔 (秒, Lighter下单较快)")
@@ -2576,6 +2631,7 @@ def main():
     bot._post_close_cooldown = args.cooldown
     bot._loss_breaker_threshold = args.loss_breaker_bps
     bot._loss_breaker_duration = args.loss_breaker_sec
+    bot._loss_streak_limit = args.loss_streak
 
     if uvloop is not None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class O1Feed(BaseFeed):
     EXCHANGE_NAME = "01 Exchange"
     MAKER_FEE_BPS = 1.0   # 0.01%
-    TAKER_FEE_BPS = 5.0   # 0.05%
+    TAKER_FEE_BPS = 3.5   # 0.035%
 
     def __init__(self, symbol: str):
         super().__init__(symbol)

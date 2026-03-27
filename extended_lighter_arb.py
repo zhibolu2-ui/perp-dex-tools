@@ -98,6 +98,7 @@ class ConvergenceArbBot:
         self.position_direction: Optional[str] = None  # "long_L_short_X" or "long_X_short_L"
         self._open_l_refs: List[Tuple[Decimal, Decimal]] = []  # (ref_price, qty)
         self._open_x_refs: List[Tuple[Decimal, Decimal]] = []
+        self._last_extended_trade_ts: float = 0.0  # for add-cooldown after consuming OB depth
 
         # clients
         self.lighter_client: Optional[SignerClient] = None
@@ -290,7 +291,7 @@ class ConvergenceArbBot:
     # ═══════════════════════════════════════════════
 
     def _get_extended_ws_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        """Get best bid/ask from ExtendedClient WebSocket (real-time, depth=1).
+        """Get best bid/ask from ExtendedClient WebSocket full-depth orderbook.
         Returns (bid, ask) or (None, None) if unavailable."""
         if self.extended_client and self.extended_client.orderbook:
             ob = self.extended_client.orderbook
@@ -302,6 +303,47 @@ class ConvergenceArbBot:
                 except (KeyError, IndexError, TypeError):
                     pass
         return None, None
+
+    def _extended_ob_age_ms(self) -> float:
+        """Milliseconds since the last Extended orderbook update."""
+        if not self.extended_client or self.extended_client._ob_last_update_ts == 0:
+            return 999999.0
+        return (time.time() - self.extended_client._ob_last_update_ts) * 1000
+
+    def _get_extended_ws_vwap(self, qty: float) -> Tuple[Optional[float], Optional[float]]:
+        """Calculate VWAP buy/sell prices from Extended full-depth orderbook.
+        Returns (vwap_buy_cost, vwap_sell_proceeds) or (None, None)."""
+        if not self.extended_client or not self.extended_client.orderbook:
+            return None, None
+        ob = self.extended_client.orderbook
+        bids = ob.get('bid', [])
+        asks = ob.get('ask', [])
+        if not bids or not asks:
+            return None, None
+
+        def _vwap(levels: list, target_qty: float) -> Optional[float]:
+            filled = 0.0
+            cost = 0.0
+            for lvl in levels:
+                try:
+                    p = float(lvl['p'])
+                    q = float(lvl.get('c', lvl.get('q', '0')))
+                except (ValueError, KeyError):
+                    continue
+                if q <= 0:
+                    continue
+                take = min(q, target_qty - filled)
+                cost += p * take
+                filled += take
+                if filled >= target_qty - 1e-12:
+                    return cost / filled
+            if filled > 0:
+                return cost / filled
+            return None
+
+        vwap_buy = _vwap(asks, qty)
+        vwap_sell = _vwap(bids, qty)
+        return vwap_buy, vwap_sell
 
     # ═══════════════════════════════════════════════
     #  Position Queries (REST)
@@ -350,12 +392,15 @@ class ConvergenceArbBot:
         return price
 
     async def _place_lighter_taker(self, side: str, qty: Decimal, ref_price: Decimal) -> bool:
-        """Place IOC market order on Lighter (fills immediately or cancels)."""
+        """Place IOC market order on Lighter and verify fill via REST position check.
+        Returns True only when the fill is confirmed by position change."""
         is_ask = side.lower() == "sell"
         if is_ask:
-            price = self._round_lighter_price(ref_price * Decimal("0.9995"))
+            price = self._round_lighter_price(ref_price * Decimal("0.9985"))
         else:
-            price = self._round_lighter_price(ref_price * Decimal("1.0005"))
+            price = self._round_lighter_price(ref_price * Decimal("1.0015"))
+
+        pre_trade_pos = self.lighter_position
 
         client_order_index = int(time.time() * 1000)
         try:
@@ -372,7 +417,28 @@ class ConvergenceArbBot:
                 self.logger.error(f"[Lighter] IOC 下单失败: {error}")
                 return False
             self.logger.info(f"[Lighter] IOC {side} {qty} ref={ref_price:.2f} limit={price:.2f}")
-            return True
+
+            for verify_attempt in range(4):
+                await asyncio.sleep(0.3)
+                try:
+                    new_pos = await self._get_lighter_position()
+                    if side.lower() == "buy":
+                        delta = new_pos - pre_trade_pos
+                    else:
+                        delta = pre_trade_pos - new_pos
+                    if delta >= qty * Decimal("0.5"):
+                        self.lighter_position = new_pos
+                        self.logger.info(
+                            f"[Lighter] 成交确认(第{verify_attempt+1}次): "
+                            f"pos {pre_trade_pos} → {new_pos} Δ={delta}")
+                        return True
+                except Exception as e:
+                    self.logger.warning(f"[Lighter] 成交验证查询失败: {e}")
+
+            self.logger.warning(
+                f"[Lighter] IOC 提交成功但未确认成交 "
+                f"(限价={price:.2f} ref={ref_price:.2f} side={side})")
+            return False
         except Exception as e:
             if "nonce" in str(e).lower():
                 try:
@@ -412,6 +478,9 @@ class ConvergenceArbBot:
                     if self._x_ioc_fill_qty > 0:
                         self.logger.info(
                             f"[Extended] WS确认成交 qty={self._x_ioc_fill_qty}")
+                        if self.extended_client:
+                            self.extended_client.deduct_filled_qty(
+                                side.lower(), float(self._x_ioc_fill_qty))
                 except asyncio.TimeoutError:
                     self.logger.warning("[Extended] WS确认超时(3s), 继续")
                 self._x_ioc_pending_id = None
@@ -557,6 +626,14 @@ class ConvergenceArbBot:
         """Estimate P&L from recorded ref prices (best bid/ask at order time)."""
         if not self._open_l_refs or not self._open_x_refs:
             return
+        threshold = self.order_size * Decimal("0.1")
+        l_has = abs(self.lighter_position) >= threshold
+        x_has = abs(self.extended_position) >= threshold
+        if l_has != x_has:
+            self.logger.warning(
+                f"[P&L估算] 跳过: 单腿无持仓 L={self.lighter_position} "
+                f"X={self.extended_position} (ref价格不可靠)")
+            return
         l_open_cost = sum(p * q for p, q in self._open_l_refs)
         l_open_qty = sum(q for _, q in self._open_l_refs)
         x_open_cost = sum(p * q for p, q in self._open_x_refs)
@@ -603,7 +680,27 @@ class ConvergenceArbBot:
         """Retry a failed leg up to 3 times; if still failing, close the other leg.
         `which` = failed exchange, `side` = what the failed exchange was supposed to do.
         Returns True if repair succeeded, False if had to undo."""
+        pre_repair_pos = self.lighter_position if which == "lighter" else self.extended_position
+
         for attempt in range(1, 4):
+            try:
+                if which == "lighter":
+                    cur = await self._get_lighter_position()
+                    self.lighter_position = cur
+                else:
+                    cur = await self._get_extended_position()
+                    self.extended_position = cur
+                if side.lower() == "buy":
+                    delta = cur - pre_repair_pos
+                else:
+                    delta = pre_repair_pos - cur
+                if delta >= qty * Decimal("0.5"):
+                    self.logger.info(
+                        f"[修复] {which} 延迟成交已确认: pos {pre_repair_pos} → {cur}")
+                    return True
+            except Exception:
+                pass
+
             fresh_ref = self._fresh_ref_price(which, side, ref_price)
             self.logger.info(f"[修复] {which} {side} {qty} 第 {attempt}/3 次重试 ref={fresh_ref:.2f}")
             await asyncio.sleep(0.3)
@@ -894,12 +991,19 @@ class ConvergenceArbBot:
                 mid_spread_bps = float((x_mid - l_mid) / l_mid * 10000)
                 abs_mid_spread = abs(mid_spread_bps)
 
-                # ── VWAP spread: Lighter uses full-depth feed, Extended uses WS BBO ──
+                # ── VWAP spread: Lighter uses depth, Extended uses BBO (depth=1) ──
                 qty_f = float(self.order_size)
                 l_vwap_buy = ls.vwap_buy(qty_f)
                 l_vwap_sell = ls.vwap_sell(qty_f)
 
-                if x_ws_bid is not None and x_ws_ask is not None:
+                x_vwap_buy_depth, x_vwap_sell_depth = (None, None)
+                if not self.dry_run:
+                    x_vwap_buy_depth, x_vwap_sell_depth = self._get_extended_ws_vwap(qty_f)
+
+                if x_vwap_buy_depth is not None and x_vwap_sell_depth is not None:
+                    x_vwap_buy = x_vwap_buy_depth
+                    x_vwap_sell = x_vwap_sell_depth
+                elif x_ws_bid is not None and x_ws_ask is not None:
                     x_vwap_buy = float(x_ws_ask)
                     x_vwap_sell = float(x_ws_bid)
                 else:
@@ -981,16 +1085,18 @@ class ConvergenceArbBot:
                         await asyncio.sleep(self.interval)
                         continue
 
+                    ob_age = self._extended_ob_age_ms() if not self.dry_run else 0
                     if (vwap_direction
                             and vwap_spread_bps >= self.effective_open_bps
-                            and cur_pos < self.max_position):
+                            and cur_pos < self.max_position
+                            and ob_age < 500):
                         direction = vwap_direction
                         self.state = STATE_OPENING
                         self._last_open_spread = vwap_spread_bps
                         self.logger.info(
                             f"[信号] VWAP价差={vwap_spread_bps:+.2f}bps >= "
                             f"{self.effective_open_bps}({self.open_bps}+{self.exec_buffer_bps})  "
-                            f"mid={mid_spread_bps:+.2f}bps  方向={direction}")
+                            f"mid={mid_spread_bps:+.2f}bps  方向={direction}  OB_age={ob_age:.0f}ms")
                         t_signal = time.time()
                         open_ok = await self._open_positions(direction, self.order_size, l_mid, x_mid, vwap_spread_bps)
 
@@ -1038,6 +1144,7 @@ class ConvergenceArbBot:
                                 continue
 
                             self._open_spreads_weighted.append((vwap_spread_bps, self.order_size))
+                            self._last_extended_trade_ts = time.time()
                             self.state = STATE_IN_POSITION
                             if self.position_opened_at is None:
                                 self.position_opened_at = now
@@ -1075,7 +1182,10 @@ class ConvergenceArbBot:
                         open_spread = self._weighted_avg_open_spread()
                         await self._close_all_positions(l_mid, x_mid, "收敛")
 
-                        gross_bps = open_spread - abs_mid_spread if open_spread else 0
+                        if self.position_direction == "long_X_short_L":
+                            gross_bps = open_spread + mid_spread_bps if open_spread else 0
+                        else:
+                            gross_bps = open_spread - mid_spread_bps if open_spread else 0
                         fee_bps = 5.0
                         net_bps = gross_bps - fee_bps
                         cumulative_net_bps += net_bps
@@ -1085,7 +1195,7 @@ class ConvergenceArbBot:
                         self.logger.info(
                             f"[平仓完成] 信号→完成={close_ms:.0f}ms  "
                             f"加权开仓={open_spread:+.2f}bps({n_legs}笔) "
-                            f"平仓={abs_mid_spread:.2f}bps  "
+                            f"平仓mid={mid_spread_bps:+.2f}bps  "
                             f"毛利={gross_bps:+.2f} 费用={fee_bps:.1f} "
                             f"净利={net_bps:+.2f}bps 累积={cumulative_net_bps:+.2f}bps")
                         self._csv_row([
@@ -1157,14 +1267,18 @@ class ConvergenceArbBot:
                         continue
 
                     # accumulation: add more if VWAP spread still wide (same direction only)
+                    add_cooldown_ok = (time.time() - self._last_extended_trade_ts) > 0.5
+                    ob_age_add = self._extended_ob_age_ms() if not self.dry_run else 0
                     if (vwap_direction
                             and vwap_spread_bps >= self.effective_open_bps
-                            and cur_pos + self.order_size <= self.max_position):
+                            and cur_pos + self.order_size <= self.max_position
+                            and add_cooldown_ok
+                            and ob_age_add < 500):
                         direction = self.position_direction or vwap_direction
                         if vwap_direction == direction:
                             self.logger.info(
                                 f"[加仓] VWAP={vwap_spread_bps:+.2f}bps mid={mid_spread_bps:+.2f}bps "
-                                f"当前仓位={cur_pos} 加 {self.order_size}")
+                                f"当前仓位={cur_pos} 加 {self.order_size}  OB_age={ob_age_add:.0f}ms")
                             self.state = STATE_OPENING
                             add_ok = await self._open_positions(direction, self.order_size, l_mid, x_mid, vwap_spread_bps)
                             if not add_ok:
@@ -1194,6 +1308,7 @@ class ConvergenceArbBot:
                                 last_reconcile = time.time()
                                 continue
                             self._open_spreads_weighted.append((vwap_spread_bps, self.order_size))
+                            self._last_extended_trade_ts = time.time()
                             self._csv_row([
                                 datetime.now(timezone.utc).isoformat(), "ADD", direction,
                                 "buy" if direction == "long_L_short_X" else "sell",

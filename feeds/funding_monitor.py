@@ -138,6 +138,7 @@ class FundingRateMonitor:
                 src = item.get("exchange", "").lower()
 
                 if src == "lighter":
+                    # Lighter settles every 1h; API returns per-hour rate
                     self._lighter_rate = rate
                     continue
 
@@ -145,20 +146,22 @@ class FundingRateMonitor:
                 if display_name is None:
                     continue
 
+                # All rates from aggregated API are in 8h-premium format
+                hourly = rate / 8.0
                 if display_name not in self._rates:
                     self._rates[display_name] = FundingSnapshot(
                         exchange=display_name,
                         rate=rate,
-                        interval_h=1.0,
-                        annualized_pct=rate * (365 * 24) * 100,
+                        interval_h=8.0,
+                        annualized_pct=hourly * (365 * 24) * 100,
                         timestamp=time.time(),
                     )
                 else:
                     existing = self._rates[display_name]
                     if existing.timestamp < time.time() - self.poll_interval * 0.8:
                         existing.rate = rate
-                        existing.interval_h = 1.0
-                        existing.annualized_pct = rate * (365 * 24) * 100
+                        existing.interval_h = 8.0
+                        existing.annualized_pct = hourly * (365 * 24) * 100
                         existing.timestamp = time.time()
 
         except Exception as exc:

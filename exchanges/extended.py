@@ -90,8 +90,11 @@ class ExtendedClient(BaseExchangeClient):
         # Initialize logger using the same format as helpers
         self.logger = TradingLogger(exchange="extended", ticker=self.config.ticker, log_to_console=True)
         self._order_update_handler = None
+        self._ob_update_callback = None
 
         self.orderbook = None
+        self._ob_seq = 0
+        self._ob_last_update_ts: float = 0.0
         
         # For websocket
         self._stop_event = asyncio.Event()
@@ -125,7 +128,7 @@ class ExtendedClient(BaseExchangeClient):
                 self._stop_event,
                 extra_headers=[("X-API-Key", self.api_key)]
                 )),
-            # connect to the orderbook update stream
+            # connect to BBO orderbook stream (10ms push, depth=1)
             asyncio.create_task(_stream_worker(
                 host + "/orderbooks/" + self.config.ticker + "-USD" + "?depth=1",
                 self.handle_orderbook,
@@ -163,6 +166,8 @@ class ExtendedClient(BaseExchangeClient):
             
             # 5. Reset internal state
             self.orderbook = None
+            self._ob_seq = 0
+            self._ob_last_update_ts = 0.0
             self._order_update_handler = None
             
             self.logger.log("Extended exchange disconnected successfully", "INFO")
@@ -723,39 +728,77 @@ class ExtendedClient(BaseExchangeClient):
         self._order_update_handler = handler
                 
     async def handle_orderbook(self, message):
-        """Handle orderbook updates from WebSocket using correct pattern."""
+        """Handle depth=1 BBO orderbook updates (10ms push)."""
         try:
-            self.logger.log("Received orderbook update", "DEBUG")
-
-            # Parse the message structure
             if isinstance(message, str):
                 message = json.loads(message)
 
-            # Check if this is a orderbook update
-            event = message.get("type", "")
-            if event == "SNAPSHOT":
-                data = message.get('data', {})
-                market = data.get('m', '')
-                bids = data.get('b', [])
-                asks = data.get('a', [])
-                
-                # update orderbook
+            data = message.get('data', {})
+            market = data.get('m', '')
+            bids = data.get('b', [])
+            asks = data.get('a', [])
+
+            if bids and asks:
                 self.orderbook = {
                     'market': market,
-                    'bid': bids,  # should be list of [{"p": price, "q": quantity}] with a length of 1 
-                    'ask': asks   # should be list of [{"p": price, "q": quantity}] with a length of 1
+                    'bid': bids,
+                    'ask': asks,
                 }
-                
-                self.logger.log(f"Orderbook updated for {market}: bid={bids[0] if bids else 'N/A'}, ask={asks[0] if asks else 'N/A'}", "DEBUG")
-                
+                self._ob_last_update_ts = time.time()
+                if self._ob_update_callback is not None:
+                    try:
+                        self._ob_update_callback()
+                    except Exception:
+                        pass
+
         except asyncio.CancelledError:
-            self.logger.log("Orderbook update handler cancelled", "INFO")
             raise
         except Exception as e:
             self.logger.log(f"Error handling orderbook update: {e}", "ERROR")
-            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
         
                 
+    def _is_book_crossed(self) -> bool:
+        """Return True if best bid >= best ask (crossed/locked book)."""
+        if not self.orderbook:
+            return False
+        ob_bids = self.orderbook.get('bid', [])
+        ob_asks = self.orderbook.get('ask', [])
+        if ob_bids and ob_asks:
+            try:
+                return float(ob_bids[0]['p']) >= float(ob_asks[0]['p'])
+            except (KeyError, IndexError, ValueError):
+                pass
+        return False
+
+    def deduct_filled_qty(self, side: str, filled_qty: float):
+        """After a fill, remove consumed liquidity from the local orderbook.
+        side='buy' means we lifted asks; side='sell' means we hit bids."""
+        if not self.orderbook:
+            return
+        book_key = 'ask' if side == 'buy' else 'bid'
+        book = self.orderbook.get(book_key, [])
+        remaining = filled_qty
+        to_remove = []
+        for i, lvl in enumerate(book):
+            try:
+                q = float(lvl.get('c', lvl.get('q', '0')))
+            except (ValueError, KeyError):
+                continue
+            if q <= 0:
+                continue
+            if remaining >= q - 1e-12:
+                remaining -= q
+                to_remove.append(i)
+            else:
+                new_q = q - remaining
+                book[i] = {'p': lvl['p'], 'q': str(new_q), 'c': str(new_q)}
+                remaining = 0
+                break
+            if remaining <= 1e-12:
+                break
+        for idx in reversed(to_remove):
+            book.pop(idx)
+
     def get_exchange_name(self) -> str:
         """Get the exchange name."""
         return "extended"
