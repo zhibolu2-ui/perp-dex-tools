@@ -469,11 +469,14 @@ class TakerBot:
         """Fetch the actual fill price from Hotstuff fills API with retries."""
         self._last_hotstuff_avg_price = None
         from hotstuff.methods.info.account import FillsParams
-        params = FillsParams(
-            address=self.hs_address,
-            symbol=self.hs_symbol,
-            limit=5,
-        )
+        import inspect
+        fp_params = inspect.signature(FillsParams).parameters
+        kw = {"symbol": self.hs_symbol, "limit": 5}
+        if "address" in fp_params:
+            kw["address"] = self.hs_address
+        elif "user" in fp_params:
+            kw["user"] = self.hs_address
+        params = FillsParams(**kw)
         loop = asyncio.get_event_loop()
         for attempt in range(4):
             if attempt > 0:
@@ -571,7 +574,11 @@ class TakerBot:
                     delta = pre_pos - new_pos
                 if delta > 0:
                     actual_qty = abs(delta)
-                    await self._fetch_hotstuff_fill_price(ref_price)
+                    try:
+                        await self._fetch_hotstuff_fill_price(ref_price)
+                    except Exception as fp_err:
+                        self.logger.debug(f"[Hotstuff] fill price fetch: {fp_err}")
+                        self._last_hotstuff_avg_price = ref_price
                     self.logger.info(
                         f"[Hotstuff] REST确认成交: "
                         f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
@@ -587,7 +594,12 @@ class TakerBot:
                             delta = pre_pos - new_pos
                         if delta > 0:
                             actual_qty = abs(delta)
-                            await self._fetch_hotstuff_fill_price(ref_price)
+                            try:
+                                await self._fetch_hotstuff_fill_price(ref_price)
+                            except Exception as fp_err:
+                                self.logger.debug(
+                                    f"[Hotstuff] fill price fetch: {fp_err}")
+                                self._last_hotstuff_avg_price = ref_price
                             self.logger.info(
                                 f"[Hotstuff] REST确认成交(第{attempt+2}次): "
                                 f"pos {pre_pos} → {new_pos} Δ={actual_qty}"
