@@ -393,7 +393,7 @@ class TakerBot:
             self.logger.info(f"[Lighter] taker {side} {qty} ref={ref_price:.2f}")
 
             try:
-                await asyncio.wait_for(self._lighter_fill_event.wait(), timeout=0.5)
+                await asyncio.wait_for(self._lighter_fill_event.wait(), timeout=0.35)
             except asyncio.TimeoutError:
                 pass
 
@@ -538,7 +538,14 @@ class TakerBot:
                 f"[Hotstuff] IOC {side} {qty_r} ref={ref_price:.2f} "
                 f"oid={oid}")
 
-            await asyncio.sleep(0.3)
+            tx_hash = result.get("tx_hash", "")
+            if tx_hash and not error:
+                self._last_hotstuff_avg_price = Decimal(str(aggressive))
+                self.logger.info(
+                    f"[Hotstuff] 链上确认: tx={tx_hash[:18]}.. fill={aggressive}")
+                return qty_r
+
+            await asyncio.sleep(0.05)
             try:
                 new_pos = await self._get_hotstuff_position()
                 if side == "buy":
@@ -546,7 +553,6 @@ class TakerBot:
                 else:
                     delta = pre_pos - new_pos
                 if delta >= qty_r * Decimal("0.5"):
-                    self.hotstuff_position = new_pos
                     actual_qty = abs(delta)
                     await self._fetch_hotstuff_fill_price(ref_price)
                     self.logger.info(
@@ -555,7 +561,7 @@ class TakerBot:
                         f" fill={self._last_hotstuff_avg_price}")
                     return actual_qty
                 else:
-                    for attempt, delay in enumerate([0.3, 0.5]):
+                    for attempt, delay in enumerate([0.1, 0.2]):
                         await asyncio.sleep(delay)
                         new_pos = await self._get_hotstuff_position()
                         if side == "buy":
@@ -563,7 +569,6 @@ class TakerBot:
                         else:
                             delta = pre_pos - new_pos
                         if delta >= qty_r * Decimal("0.5"):
-                            self.hotstuff_position = new_pos
                             actual_qty = abs(delta)
                             await self._fetch_hotstuff_fill_price(ref_price)
                             self.logger.info(
