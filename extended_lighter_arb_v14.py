@@ -888,8 +888,15 @@ class TakerBot:
         self, l_bid: Decimal, l_ask: Decimal,
         x_bid: Decimal, x_ask: Decimal,
     ) -> float:
-        """Return current spread gap in bps (lower = more converged)."""
-        if self.extended_position > 0:
+        """Return current spread gap in bps (lower = more converged).
+        Uses position_direction for consistency even after partial close."""
+        if self.position_direction == "long_X_short_L":
+            current_gap = l_ask - x_bid
+            ref = x_bid if x_bid > 0 else l_ask
+        elif self.position_direction == "long_L_short_X":
+            current_gap = x_ask - l_bid
+            ref = l_bid if l_bid > 0 else x_ask
+        elif self.extended_position > 0:
             current_gap = l_ask - x_bid
             ref = x_bid if x_bid > 0 else l_ask
         elif self.extended_position < 0:
@@ -1921,6 +1928,13 @@ class TakerBot:
                     await self._reconcile_positions()
                     last_reconcile = now
                     cur_pos = abs(self.extended_position)
+                    if (self.state == State.IN_POSITION
+                            and self._total_open_qty > 0):
+                        actual_pos = min(
+                            abs(self.extended_position),
+                            abs(self.lighter_position))
+                        if actual_pos > self._total_open_qty:
+                            self._total_open_qty = actual_pos
                     net_imbalance = abs(
                         self.lighter_position + self.extended_position)
                     if net_imbalance > self.order_size * Decimal("0.5"):
@@ -2083,6 +2097,11 @@ class TakerBot:
                                             self.order_size, sp)
                                         if ok:
                                             ladder_opened = True
+                                            self._total_open_qty = min(
+                                                abs(self.extended_position),
+                                                abs(self.lighter_position))
+                                            self._tier_closed_pct = 0.0
+                                            self._tier_close_records.clear()
                                         else:
                                             await asyncio.sleep(1.0)
 
@@ -2092,33 +2111,43 @@ class TakerBot:
                                 and self._tier_closed_pct > 0
                                 and self._tier_closed_pct < 100
                                 and self._total_open_qty > 0
-                                and self.position_direction):
+                                and self.position_direction
+                                and now - self._last_trade_time > self._ladder_cooldown):
                             opp = self._check_open_opportunity(
                                 l_bid, l_ask, x_ws_bid, x_ws_ask)
                             if (opp and opp[0] == self.position_direction):
-                                refill_qty = (
-                                    self._total_open_qty - abs(self.extended_position))
-                                refill_qty = refill_qty.quantize(
-                                    self.extended_min_order_size,
-                                    rounding=ROUND_DOWN)
+                                cur_x = abs(self.extended_position)
+                                cur_l = abs(self.lighter_position)
+                                cur_min = min(cur_x, cur_l)
+                                refill_qty = self._total_open_qty - cur_min
+                                if refill_qty > Decimal("0"):
+                                    refill_qty = refill_qty.quantize(
+                                        self.extended_min_order_size,
+                                        rounding=ROUND_DOWN)
                                 if refill_qty >= self.order_size * Decimal("0.05"):
                                     d, ls2, xs, lr, xr, sp = opp
                                     self.logger.info(
                                         f"[回补] 价差回升={sp:.1f}bps "
                                         f"回补已平部分 {refill_qty} "
-                                        f"(已平{self._tier_closed_pct:.0f}%)")
+                                        f"(已平{self._tier_closed_pct:.0f}% "
+                                        f"X={cur_x} L={cur_l})")
                                     ok = await self._open_position(
                                         d, ls2, xs, lr, xr, refill_qty, sp)
                                     if ok:
                                         refilled = True
                                         self._tier_closed_pct = 0.0
                                         self._tier_close_records.clear()
-                                        self._total_open_qty = abs(
-                                            self.extended_position)
+                                        self._total_open_qty = min(
+                                            abs(self.extended_position),
+                                            abs(self.lighter_position))
                                         self.logger.info(
                                             f"[回补成功] 仓位恢复到 "
                                             f"{self._total_open_qty}, "
                                             f"分批进度重置")
+                                    else:
+                                        self.logger.info(
+                                            "[回补] 本次未成交, 下次重试")
+                                        self._last_trade_time = time.time()
 
                         # Close check (skip if just opened/added layer/refilled)
                         if (not just_traded and not ladder_opened
