@@ -2035,6 +2035,24 @@ class TakerBot:
                         self.state = State.IDLE
                         continue
 
+                    min_tradeable = self.order_size * Decimal("0.05")
+                    x_dust = abs(self.extended_position) < min_tradeable
+                    l_dust = abs(self.lighter_position) < min_tradeable
+                    if x_dust and l_dust and not self.dry_run:
+                        net_imb = abs(
+                            self.lighter_position + self.extended_position)
+                        self.logger.info(
+                            f"[残余清理] 仓位过小无法正常交易 "
+                            f"X={self.extended_position} "
+                            f"L={self.lighter_position} "
+                            f"净偏差={net_imb}, 重置为IDLE")
+                        if net_imb > self.order_size * Decimal("0.5"):
+                            await self._emergency_flatten()
+                        self._reset_position_state()
+                        self.state = State.IDLE
+                        last_reconcile = time.time() - 50
+                        continue
+
                     if (self.position_opened_at
                             and now - self.position_opened_at > self.max_hold_sec):
                         self.logger.warning(
