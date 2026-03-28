@@ -943,6 +943,11 @@ class TakerBot:
                     self.logger.info(
                         "[开仓] 二次验证价差已消失, 放弃")
                     return False
+                if recheck[0] != direction:
+                    self.logger.info(
+                        f"[开仓] 二次验证方向翻转 "
+                        f"{direction}→{recheck[0]}, 放弃")
+                    return False
                 _, _, _, l_ref, x_ref, spread_bps = recheck
 
             l1_l, l1_x = self._get_l1_depth(l_side, x_side)
@@ -1552,18 +1557,23 @@ class TakerBot:
                     else:
                         tasks.append(asyncio.sleep(0))
 
+                x_task_idx = -1
                 if tasks:
+                    if l_qty >= self.order_size * Decimal("0.01"):
+                        x_task_idx = 1
+                    else:
+                        x_task_idx = 0
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for i, r in enumerate(results):
                         if isinstance(r, Exception):
                             self.logger.error(
                                 f"[紧急平仓] 任务{i}异常: {r}")
 
-                    if (len(results) >= 2
-                            and not isinstance(results[-1], Exception)
-                            and results[-1] is not None
-                            and results[-1] > 0):
-                        x_fill = results[-1]
+                    if (x_task_idx < len(results)
+                            and not isinstance(results[x_task_idx], Exception)
+                            and results[x_task_idx] is not None
+                            and results[x_task_idx] > 0):
+                        x_fill = results[x_task_idx]
                         x_side_used = ("sell" if self.extended_position > 0
                                        else "buy")
                         if x_side_used == "sell":
@@ -1744,11 +1754,17 @@ class TakerBot:
                     l_qty = abs(self.lighter_position)
                     self._open_x_refs = [(x_est, x_qty)] if x_qty > 0 else []
                     self._open_l_refs = [(l_est, l_qty)] if l_qty > 0 else []
+                    self._total_open_qty = min(x_qty, l_qty)
+                    self._tier_closed_pct = 0.0
+                    self._tier_close_records.clear()
                     if self.position_direction == "long_X_short_L":
                         _est_sp = float((l_est - x_est) / l_est * 10000)
                     else:
                         _est_sp = float((x_est - l_est) / l_est * 10000)
                     self._last_open_spread_bps = max(_est_sp, self.target_spread)
+                    self.logger.info(
+                        f"[启动恢复] _total_open_qty={self._total_open_qty} "
+                        f"方向={self.position_direction}")
 
         self.logger.info(f"进入主循环  状态={self.state.value}")
         last_reconcile = time.time()
