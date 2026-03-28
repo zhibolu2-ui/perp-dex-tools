@@ -2074,8 +2074,10 @@ class TakerBot:
                                        < self._min_hold_sec)
 
                         # Ladder: add layer if spread widens
+                        # Skip ladder when partially closed — refill takes priority
                         ladder_opened = False
                         if (self.ladder_step > 0
+                                and self._tier_closed_pct <= 0
                                 and cur_pos < self.max_position
                                     - self.order_size * Decimal("0.01")
                                 and self.position_direction
