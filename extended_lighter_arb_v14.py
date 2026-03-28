@@ -1970,7 +1970,13 @@ class TakerBot:
                     has_l = abs(self.lighter_position) >= self.order_size * Decimal("0.01")
                     has_x = abs(self.extended_position) >= self.order_size * Decimal("0.01")
                     if has_l or has_x:
-                        if has_l and has_x:
+                        _idle_min_trade = self.order_size * Decimal("0.05")
+                        _idle_both_dust = (
+                            abs(self.extended_position) < _idle_min_trade
+                            and abs(self.lighter_position) < _idle_min_trade)
+                        if _idle_both_dust:
+                            pass
+                        elif has_l and has_x:
                             self.logger.warning(
                                 f"[IDLE] 检测到残余双边仓位 "
                                 f"L={self.lighter_position} "
