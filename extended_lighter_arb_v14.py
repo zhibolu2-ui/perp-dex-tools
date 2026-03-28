@@ -2086,8 +2086,43 @@ class TakerBot:
                                         else:
                                             await asyncio.sleep(1.0)
 
-                        # Close check (skip if just opened/added layer)
-                        if not just_traded and not ladder_opened:
+                        # Re-fill: after partial close, if spread widens back → re-open closed portion
+                        refilled = False
+                        if (not just_traded and not ladder_opened
+                                and self._tier_closed_pct > 0
+                                and self._tier_closed_pct < 100
+                                and self._total_open_qty > 0
+                                and self.position_direction):
+                            opp = self._check_open_opportunity(
+                                l_bid, l_ask, x_ws_bid, x_ws_ask)
+                            if (opp and opp[0] == self.position_direction):
+                                refill_qty = (
+                                    self._total_open_qty - abs(self.extended_position))
+                                refill_qty = refill_qty.quantize(
+                                    self.extended_min_order_size,
+                                    rounding=ROUND_DOWN)
+                                if refill_qty >= self.order_size * Decimal("0.05"):
+                                    d, ls2, xs, lr, xr, sp = opp
+                                    self.logger.info(
+                                        f"[回补] 价差回升={sp:.1f}bps "
+                                        f"回补已平部分 {refill_qty} "
+                                        f"(已平{self._tier_closed_pct:.0f}%)")
+                                    ok = await self._open_position(
+                                        d, ls2, xs, lr, xr, refill_qty, sp)
+                                    if ok:
+                                        refilled = True
+                                        self._tier_closed_pct = 0.0
+                                        self._tier_close_records.clear()
+                                        self._total_open_qty = abs(
+                                            self.extended_position)
+                                        self.logger.info(
+                                            f"[回补成功] 仓位恢复到 "
+                                            f"{self._total_open_qty}, "
+                                            f"分批进度重置")
+
+                        # Close check (skip if just opened/added layer/refilled)
+                        if (not just_traded and not ladder_opened
+                                and not refilled):
                             tier_hit = self._check_close_condition(
                                 l_bid, l_ask, x_ws_bid, x_ws_ask)
                             if tier_hit is not None:
