@@ -41,13 +41,16 @@ async def _stream_worker(
     while not stop_event.is_set():
         try:
             async with websockets.connect(
-                url, 
-                ping_interval=20,
-                ping_timeout=20,
+                url,
+                ping_interval=10,
+                ping_timeout=5,
+                close_timeout=5,
                 extra_headers=extra_headers
             ) as ws:
                 print(f"✅ connected to {url}")
                 async for raw in ws:
+                    if stop_event.is_set():
+                        break
                     if raw == "ping":
                         await ws.send("pong")
                         continue
@@ -62,9 +65,11 @@ async def _stream_worker(
 
                     await handler(msg)
 
+        except asyncio.CancelledError:
+            return
         except Exception as e:
             print(f"❌ {url} error: {e}")
-            await asyncio.sleep(3)  # simple reconnect delay
+            await asyncio.sleep(1)
 
 def utc_now():
     return datetime.now(tz=timezone.utc)
@@ -738,13 +743,16 @@ class ExtendedClient(BaseExchangeClient):
             bids = data.get('b', [])
             asks = data.get('a', [])
 
-            if bids and asks:
-                self.orderbook = {
-                    'market': market,
-                    'bid': bids,
-                    'ask': asks,
-                }
-                self._ob_last_update_ts = time.time()
+            self._ob_last_update_ts = time.time()
+
+            if bids or asks:
+                if self.orderbook is None:
+                    self.orderbook = {'market': market, 'bid': [], 'ask': []}
+                if bids:
+                    self.orderbook['bid'] = bids
+                if asks:
+                    self.orderbook['ask'] = asks
+                self.orderbook['market'] = market
                 if self._ob_update_callback is not None:
                     try:
                         self._ob_update_callback()

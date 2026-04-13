@@ -1,118 +1,117 @@
 #!/usr/bin/env python3
-"""
-交易所延迟基准测试 — 测量从本机到两个交易所的真实下单延迟
-"""
-import time, asyncio, os, sys
-from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+"""Benchmark each component of Hotstuff order flow."""
+import time, os, json, requests, asyncio
 from dotenv import load_dotenv
+from eth_account import Account
+from decimal import Decimal
+from dataclasses import asdict
+
 load_dotenv()
 
-async def bench_extended():
-    from x10.perpetual.accounts import StarkPerpetualAccount
-    from x10.perpetual.configuration import STARKNET_MAINNET_CONFIG
-    from x10.perpetual.orders import OrderSide, TimeInForce
-    from x10.perpetual.trading_client import PerpetualTradingClient
+from hotstuff.utils.signing import sign_action
+from hotstuff.methods.exchange.trading import UnitOrder, PlaceOrderParams, CancelAllParams
+from hotstuff.methods.exchange.op_codes import EXCHANGE_OP_CODES
+from hotstuff.utils.nonce import NonceManager
 
-    account = StarkPerpetualAccount(
-        vault=os.getenv('EXTENDED_VAULT'),
-        private_key=os.getenv('EXTENDED_STARK_KEY_PRIVATE'),
-        public_key=os.getenv('EXTENDED_STARK_KEY_PUBLIC'),
-        api_key=os.getenv('EXTENDED_API_KEY'),
-    )
-    client = PerpetualTradingClient(STARKNET_MAINNET_CONFIG, account)
-    expire = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+pk = os.getenv("HOTSTUFF_PRIVATE_KEY")
+wallet = Account.from_key(pk)
+address = os.getenv("HOTSTUFF_ADDRESS", wallet.address)
+nonce_mgr = NonceManager()
+api_url = "https://api.hotstuff.trade/"
 
-    print("=== Extended 下单延迟 ===")
-    for i in range(5):
+order = UnitOrder(instrumentId=1, side="b", positionSide="BOTH",
+                  price="70000", size="0.001", tif="IOC",
+                  ro=False, po=False, isMarket=False)
+params_dict = {"orders": [asdict(order)], "expiresAfter": int(time.time()*1000)+60000}
+
+# Warmup signing
+nonce = nonce_mgr.get_nonce(); params_dict["nonce"] = nonce
+sign_action(wallet=wallet, action=params_dict, tx_type=EXCHANGE_OP_CODES["placeOrder"])
+
+# 1. Signing
+times = []
+for _ in range(10):
+    nonce = nonce_mgr.get_nonce(); params_dict["nonce"] = nonce
+    t0 = time.perf_counter()
+    sig = sign_action(wallet=wallet, action=params_dict, tx_type=EXCHANGE_OP_CODES["placeOrder"])
+    t1 = time.perf_counter()
+    times.append((t1-t0)*1000)
+print(f"[签名] avg={sum(times)/len(times):.1f}ms  min={min(times):.1f}ms  max={max(times):.1f}ms")
+
+# 2. HTTP with keep-alive
+sess = requests.Session()
+sess.headers.update({"Content-Type": "application/json"})
+sess.post(api_url + "info", json={"method": "positions", "params": {"user": address}}, timeout=5)
+
+times_pos = []
+for _ in range(10):
+    t0 = time.perf_counter()
+    r = sess.post(api_url + "info", json={"method": "positions", "params": {"user": address}}, timeout=5)
+    t1 = time.perf_counter()
+    times_pos.append((t1-t0)*1000)
+print(f"[info/positions keep-alive] avg={sum(times_pos)/len(times_pos):.1f}ms  min={min(times_pos):.1f}ms  max={max(times_pos):.1f}ms")
+
+times_fills = []
+for _ in range(5):
+    t0 = time.perf_counter()
+    r = sess.post(api_url + "info", json={"method": "fills", "params": {"user": address, "limit": 3}}, timeout=5)
+    t1 = time.perf_counter()
+    times_fills.append((t1-t0)*1000)
+print(f"[info/fills keep-alive] avg={sum(times_fills)/len(times_fills):.1f}ms  min={min(times_fills):.1f}ms  max={max(times_fills):.1f}ms")
+
+# 3. Exchange sign+send
+cancel_dict = asdict(CancelAllParams())
+times_ex = []
+for _ in range(5):
+    nonce = nonce_mgr.get_nonce(); cancel_dict["nonce"] = nonce
+    t0 = time.perf_counter()
+    sig = sign_action(wallet=wallet, action=cancel_dict, tx_type=EXCHANGE_OP_CODES["cancelAll"])
+    payload = {"action": {"data": cancel_dict, "type": str(EXCHANGE_OP_CODES["cancelAll"])}, "signature": sig, "nonce": nonce}
+    r = sess.post(api_url + "exchange", json=payload, timeout=5)
+    t1 = time.perf_counter()
+    times_ex.append((t1-t0)*1000)
+    print(f"  exchange: {r.status_code} {r.text[:120]}")
+print(f"[exchange/sign+send keep-alive] avg={sum(times_ex)/len(times_ex):.1f}ms  min={min(times_ex):.1f}ms  max={max(times_ex):.1f}ms")
+
+# 4. New connection overhead
+times_new = []
+for _ in range(3):
+    s2 = requests.Session()
+    t0 = time.perf_counter()
+    r = s2.post(api_url + "info", json={"method": "positions", "params": {"user": address}}, timeout=5)
+    t1 = time.perf_counter()
+    times_new.append((t1-t0)*1000); s2.close()
+print(f"[info/positions 新连接] avg={sum(times_new)/len(times_new):.1f}ms")
+
+# 5. run_in_executor overhead
+async def test_executor():
+    loop = asyncio.get_event_loop()
+    times_exec = []
+    def noop(): return 42
+    for _ in range(10):
         t0 = time.perf_counter()
-        try:
-            result = await client.place_order(
-                market_name='ETH-USD',
-                amount_of_synthetic=Decimal('0.1'),
-                price=Decimal('1500.0'),
-                side=OrderSide.BUY,
-                post_only=False,
-                time_in_force=TimeInForce.IOC,
-                expire_time=expire,
-            )
-            ms = (time.perf_counter() - t0) * 1000
-            print(f"  #{i+1}: {ms:.0f}ms  status={result.status}")
-        except Exception as e:
-            ms = (time.perf_counter() - t0) * 1000
-            print(f"  #{i+1}: {ms:.0f}ms  error={e}")
-    await client.close()
+        await loop.run_in_executor(None, noop)
+        t1 = time.perf_counter()
+        times_exec.append((t1-t0)*1000)
+    print(f"[run_in_executor 空函数] avg={sum(times_exec)/len(times_exec):.2f}ms")
+asyncio.run(test_executor())
 
-async def bench_lighter():
-    from lighter.signer_client import SignerClient
-    api_key = os.getenv('API_KEY_PRIVATE_KEY')
-    client = SignerClient(
-        url='https://mainnet.zklighter.elliot.ai',
-        account_index=int(os.getenv('LIGHTER_ACCOUNT_INDEX', '0')),
-        api_private_keys={int(os.getenv('LIGHTER_API_KEY_INDEX', '0')): api_key},
-    )
-
-    print("\n=== Lighter 下单延迟 ===")
-    for i in range(5):
-        coi = int(time.time() * 1000) * 100 + i + 99
-        t0 = time.perf_counter()
-        try:
-            _, _, error = await client.create_order(
-                market_index=0,
-                client_order_index=coi,
-                base_amount=1000,
-                price=150000,
-                is_ask=False,
-                order_type=client.ORDER_TYPE_LIMIT,
-                time_in_force=client.ORDER_TIME_IN_FORCE_POST_ONLY,
-                reduce_only=False,
-                trigger_price=0,
-            )
-            ms = (time.perf_counter() - t0) * 1000
-            print(f"  #{i+1}: {ms:.0f}ms  error={error}")
-        except Exception as e:
-            ms = (time.perf_counter() - t0) * 1000
-            print(f"  #{i+1}: {ms:.0f}ms  exc={e}")
-        if i < 4:
-            await asyncio.sleep(0.05)
-
-    try:
-        future_ts = int((time.time() + 300) * 1000)
-        await client.cancel_all_orders(
-            time_in_force=client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            timestamp_ms=future_ts,
-        )
-        print("  (已清理测试挂单)")
-    except:
-        pass
-
-async def bench_network():
+# 6. aiohttp benchmark
+async def test_aiohttp():
     import aiohttp
-    print("=== 网络 RTT (TCP连接时间) ===")
-    targets = [
-        ("Extended API", "https://api.starknet.extended.exchange/api/v1/markets"),
-        ("Lighter API", "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"),
-    ]
-    for name, url in targets:
-        times = []
-        for _ in range(5):
-            async with aiohttp.ClientSession() as session:
-                t0 = time.perf_counter()
-                async with session.get(url) as resp:
-                    await resp.read()
-                ms = (time.perf_counter() - t0) * 1000
-                times.append(ms)
-        avg = sum(times[1:]) / len(times[1:])
-        print(f"  {name}: 冷启动={times[0]:.0f}ms  预热后avg={avg:.0f}ms")
+    async with aiohttp.ClientSession() as asess:
+        await asess.post(api_url + "info", json={"method": "positions", "params": {"user": address}})
+        times_aio = []
+        for _ in range(10):
+            t0 = time.perf_counter()
+            async with asess.post(api_url + "info", json={"method": "positions", "params": {"user": address}}) as r:
+                await r.json()
+            t1 = time.perf_counter()
+            times_aio.append((t1-t0)*1000)
+        print(f"[aiohttp positions keep-alive] avg={sum(times_aio)/len(times_aio):.1f}ms  min={min(times_aio):.1f}ms  max={max(times_aio):.1f}ms")
+try:
+    asyncio.run(test_aiohttp())
+except Exception as e:
+    print(f"[aiohttp] 不可用: {e}")
 
-async def main():
-    print(f"延迟基准测试 @ {datetime.now()}\n")
-    await bench_network()
-    await bench_extended()
-    await bench_lighter()
-    
-    print("\n=== 总结 ===")
-    print("对冲完成估算 = WS延迟(~50ms) + Extended IOC(预热后)")
-    print("策略B可行条件: Extended IOC预热后 < 200ms")
-
-asyncio.run(main())
+print("\n=== DONE ===")

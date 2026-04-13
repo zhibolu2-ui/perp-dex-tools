@@ -83,6 +83,7 @@ class BaseFeed(ABC):
         )
         self._lock = asyncio.Lock()
         self._running = False
+        self._ob_update_callback = None
 
     @property
     def snapshot(self) -> OrderBookSnapshot:
@@ -115,3 +116,8 @@ class BaseFeed(ABC):
                 self._snapshot.best_ask = self._snapshot.asks[0].price
             self._snapshot.timestamp = time.time()
             self._snapshot.connected = True
+        if self._ob_update_callback:
+            try:
+                self._ob_update_callback()
+            except Exception:
+                pass
