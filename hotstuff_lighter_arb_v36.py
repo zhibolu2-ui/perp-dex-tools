@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
-V35.2: 单层分仓 + 深度加权平仓优化
+HotStuff + Lighter V36: 双 Taker 套利 (HotStuff IOC 开仓 + Lighter IOC 对冲)
 
-基于 V35.1, 核心修正:
-  1. 平仓单层限制: _batch_qty 上限 = order_size, 减少 Lighter IOC 穿越深度
-  2. 深度加权检查: 平仓前验证 Lighter 前 N 档(默认L1+L2)深度 >= 平仓量
-  3. 深度不足则跳过, 等待下一轮检测, 避免吃穿薄盘造成大滑点
+基于 spread_arb_v36 移植, 将 Extended 替换为 HotStuff:
+  - 开仓: HotStuff Taker IOC (2.5 bps fee)
+  - 对冲: Lighter Taker IOC (0 bps fee)
+  - 往返费用: ≈2.5 bps
+  - 双向自动: 同时监控两个方向价差, 选择更优方向开仓
+  - L1 深度检查: 两个交易所均只检查第一档
 
-V35.1 阈值公式(不变):
+阈值公式:
   dynamic_cost = open_fee + expected_close_cost + min(latency, cap)
-               + lighter_slip + ext_slip + vol*weight + inv + edge_buffer
+               + lighter_slip + hs_slip + vol*weight + inv + edge_buffer
   threshold = max(open_spread, dynamic_cost)
 
 费用:
-  Lighter 免费账户 maker: 0 bps | Extended taker: 2.25 bps
+  Lighter taker: 0 bps | HotStuff taker: 2.5 bps
 
 用法:
-  python spread_arb_v35.py --symbol BTC --size 0.005 --max-position 0.02 \\
-    --open-spread 3.0 --close-spread 0.4 --ladder-step 0.3 \\
-    --open-jit-wait 1.5 --open-jit-price at_best \\
-    --expected-close-cost 0.8 --latency-cap 1.5 --edge-buffer 0.5 \\
-    --close-depth-levels 2
+  python hotstuff_lighter_arb_v36.py --symbol BTC --size 0.005 --max-position 0.02 \\
+    --open-spread 3.5 --close-spread 0 --ladder-step 0.4 \\
+    --expected-close-cost 0.8 --latency-cap 1.5 --edge-buffer 0.5
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import collections
 import csv
+import fcntl
 import json
 import logging
 import os
@@ -46,10 +48,16 @@ import statistics as _stats
 
 import websockets
 from dotenv import load_dotenv
+from eth_account import Account
 from lighter.signer_client import SignerClient
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from exchanges.extended import ExtendedClient
+from hotstuff import ExchangeClient, InfoClient
+from hotstuff.methods.exchange.trading import (
+    UnitOrder, PlaceOrderParams, CancelAllParams,
+)
+from hotstuff.methods.info.account import PositionsParams
+from feeds.hotstuff_feed import HotstuffFeed
 
 try:
     import uvloop
@@ -65,13 +73,55 @@ LIGHTER_REST_URL = "https://mainnet.zklighter.elliot.ai"
 
 SYMBOL_TO_MARKET = {"ETH": 0, "BTC": 1, "SOL": 2, "DOGE": 3}
 
-FEE_EXTENDED_TAKER = Decimal("0.000225")  # 2.25 bps
+FEE_HOTSTUFF_TAKER = Decimal("0.00025")   # 2.5 bps
 FEE_LIGHTER_MAKER = Decimal("0")          # 免费账户 0 bps
 
 LIGHTER_RATE_LIMIT = 36       # 安全上限(实际40), 留4次给紧急操作
 LIGHTER_RATE_WINDOW = 60.0    # 窗口60秒
 
 _TZ_CN = timezone(timedelta(hours=8))
+
+
+class PidLock:
+    """flock-based process lock to prevent duplicate instances per symbol."""
+
+    def __init__(self, symbol: str):
+        lock_dir = Path(__file__).resolve().parent / "logs"
+        lock_dir.mkdir(exist_ok=True)
+        self._path = lock_dir / f".hs_lighter_arb_{symbol}.pid"
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> bool:
+        """Try to acquire the lock. Returns True on success."""
+        self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            existing = os.read(self._fd, 64).decode().strip()
+            os.close(self._fd)
+            self._fd = None
+            print(f"[FATAL] 同一 symbol 已有实例在运行 (PID {existing}), 拒绝启动。"
+                  f"\n  锁文件: {self._path}"
+                  f"\n  如果确认旧进程已死, 删除锁文件后重试: rm {self._path}",
+                  file=sys.stderr)
+            return False
+        os.ftruncate(self._fd, 0)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        os.write(self._fd, str(os.getpid()).encode())
+        return True
+
+    def release(self):
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+            except OSError:
+                pass
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._fd = None
 
 
 class State(str, Enum):
@@ -81,11 +131,6 @@ class State(str, Enum):
     REPAIR = "REPAIR"
 
 
-class HedgeMode(str, Enum):
-    PASSIVE = "A_passive"       # maker, wait 2s
-    AGGRESSIVE = "B_aggressive" # improve/at_best, wait 0.8s
-    FAST = "C_fast"             # taker IOC (V33 default)
-    EMERGENCY = "D_emergency"   # IOC + max slip
 
 
 class LatencyTracker:
@@ -208,24 +253,20 @@ class SpreadArbBot:
         ladder_step_bps: float = 0.0,
         close_deep_bps: float = -0.5,
         close_wait_sec: float = 2.0,
-        open_jit_wait: float = 1.5,
-        close_jit_wait: float = 1.0,
-        open_jit_price_mode: str = "at_best",
-        close_jit_price_mode: str = "improve",
         # V34 new params
         vol_weight: float = 0.5,
         inv_weight: float = 1.0,
         persist_count: int = 3,
         persist_ms: float = 200.0,
         latency_cold: float = 0.8,
-        close_passive_edge: float = 3.0,
-        close_aggressive_edge: float = 1.5,
         # V35.1 entry economics params
         expected_close_cost: float = 0.8,
         latency_cap: float = 1.5,
         edge_buffer: float = 0.5,
         # V35.2 close depth params
         close_depth_levels: int = 2,
+        # V36 open depth params
+        open_depth_levels: int = 2,
     ):
         self.symbol = symbol.upper()
         self.order_size = order_size
@@ -236,10 +277,6 @@ class SpreadArbBot:
         self.ladder_step_bps = ladder_step_bps
         self.close_deep_bps = close_deep_bps
         self.close_wait_sec = close_wait_sec
-        self.open_jit_wait = open_jit_wait
-        self.close_jit_wait = close_jit_wait
-        self.open_jit_price_mode = open_jit_price_mode
-        self.close_jit_price_mode = close_jit_price_mode
         self.hedge_timeout = hedge_timeout
         self.max_order_age = max_order_age
         self.interval = interval
@@ -250,8 +287,6 @@ class SpreadArbBot:
         self.inv_weight = inv_weight
         self.persist_count = persist_count
         self.persist_ms = persist_ms / 1000.0  # convert to seconds
-        self.close_passive_edge = close_passive_edge
-        self.close_aggressive_edge = close_aggressive_edge
 
         # ── V35.1: Decoupled entry economics ──
         self.expected_close_cost = expected_close_cost
@@ -261,13 +296,16 @@ class SpreadArbBot:
         # ── V35.2: Close depth check ──
         self.close_depth_levels = close_depth_levels
 
+        # ── V36: Open depth check ──
+        self.open_depth_levels = open_depth_levels
+
         self.state = State.IDLE
         self.stop_flag = False
         self._in_flatten = False
 
         # ── Positions ──
         self.lighter_position = Decimal("0")
-        self.extended_position = Decimal("0")
+        self.hotstuff_position = Decimal("0")
 
         # ── Lighter market config ──
         self.lighter_market_index: int = SYMBOL_TO_MARKET.get(self.symbol, 1)
@@ -278,10 +316,12 @@ class SpreadArbBot:
         self.lighter_tick = Decimal("0.1")
         self.lighter_min_size_step = Decimal("0.00001")
 
-        # ── Extended config ──
-        self.extended_contract_id: str = ""
-        self.extended_tick_size = Decimal("1")
-        self.extended_min_order_size = Decimal("0.001")
+        # ── HotStuff config ──
+        self.hs_symbol: str = ""          # e.g. "BTC-PERP"
+        self.hs_instrument_id: int = 0
+        self.hs_tick_size = Decimal("1")
+        self.hs_lot_size = Decimal("0.001")
+        self.hs_address: str = ""
 
         # ── Lighter maker state ──
         self._l_buy_client_id: Optional[int] = None
@@ -291,8 +331,8 @@ class SpreadArbBot:
         self._l_buy_price = Decimal("0")
         self._l_sell_price = Decimal("0")
         self._l_placed_at: float = 0.0
-        self._l_ext_bid_at_place = Decimal("0")
-        self._l_ext_ask_at_place = Decimal("0")
+        self._l_hs_bid_at_place = Decimal("0")
+        self._l_hs_ask_at_place = Decimal("0")
         self._last_modify_ts: float = 0.0
 
         # ── Lighter API rate limiter (40 req / 60s for free accounts) ──
@@ -331,17 +371,20 @@ class SpreadArbBot:
 
         # ── Clients ──
         self.lighter_client: Optional[SignerClient] = None
-        self.extended_client: Optional[ExtendedClient] = None
+        self.hs_exchange: Optional[ExchangeClient] = None
+        self.hs_info: Optional[InfoClient] = None
+        self.hs_feed: Optional[HotstuffFeed] = None
 
-        # ── Extended WS state (IOC tracking) ──
-        self._x_ioc_pending_id: Optional[str] = None
-        self._x_ioc_confirmed = asyncio.Event()
-        self._x_ioc_fill_qty = Decimal("0")
-        self._x_ioc_fill_price: Optional[Decimal] = None
+        # ── HotStuff BBO cache ──
+        self._hs_best_bid: Optional[Decimal] = None
+        self._hs_best_ask: Optional[Decimal] = None
+        self._hs_l1_bid_size: float = 0.0
+        self._hs_l1_ask_size: float = 0.0
+        self._hs_bbo_ts: float = 0.0
 
-        # ── V22: Fill-time Extended BBO snapshot ──
-        self._fill_ext_bid: Optional[Decimal] = None
-        self._fill_ext_ask: Optional[Decimal] = None
+        # ── V22: Fill-time HotStuff BBO snapshot ──
+        self._fill_hs_bid: Optional[Decimal] = None
+        self._fill_hs_ask: Optional[Decimal] = None
         self._fill_ts: float = 0.0
 
         # ── V22: Instant hedge result (set by _instant_hedge task) ──
@@ -403,8 +446,8 @@ class SpreadArbBot:
 
         # ── Logging / CSV ──
         os.makedirs("logs", exist_ok=True)
-        self.csv_path = f"logs/spread_v35_{self.symbol}_trades.csv"
-        self.log_path = f"logs/spread_v35_{self.symbol}.log"
+        self.csv_path = f"logs/hotstuff_lighter_v36_{self.symbol}_trades.csv"
+        self.log_path = f"logs/hotstuff_lighter_v36_{self.symbol}.log"
         self._init_csv()
         self.logger = self._init_logger()
 
@@ -413,7 +456,7 @@ class SpreadArbBot:
     # ─────────────────────────────────────────────
 
     def _init_logger(self) -> logging.Logger:
-        lg = logging.getLogger(f"v35_{self.symbol}")
+        lg = logging.getLogger(f"hs_l_v36_{self.symbol}")
         lg.setLevel(logging.INFO)
         lg.handlers.clear()
 
@@ -436,11 +479,11 @@ class SpreadArbBot:
             with open(self.csv_path, "w", newline="") as f:
                 csv.writer(f).writerow([
                     "timestamp", "trade_id", "side",
-                    "lighter_price", "extended_price", "qty",
+                    "lighter_price", "hotstuff_price", "qty",
                     "spread_bps", "fee_bps", "net_bps",
                     "hedge_ms", "cumulative_bps",
                     "real_pnl", "cumulative_real_pnl",
-                    "balance_lighter", "balance_extended",
+                    "balance_lighter", "balance_hotstuff",
                     "observed_spread", "executable_spread",
                     "latency_penalty", "vol_bps",
                     "effective_threshold", "hedge_mode",
@@ -493,72 +536,68 @@ class SpreadArbBot:
                 return
         raise ValueError(f"Lighter ticker {ticker} not found")
 
-    def _init_extended(self):
-        class _Cfg:
-            def __init__(self, d):
-                for k, v in d.items():
-                    setattr(self, k, v)
-        cfg = _Cfg({
-            "ticker": self.symbol,
-            "contract_id": f"{self.symbol}-USD",
-            "take_profit": 0.1,
-            "tick_size": Decimal("1") if self.symbol == "BTC" else Decimal("0.01"),
-            "close_order_side": "sell",
-        })
-        self.extended_client = ExtendedClient(cfg)
-        self.extended_tick_size = cfg.tick_size
-        self.extended_contract_id = cfg.contract_id
-        self.extended_min_order_size = Decimal("0.001") if self.symbol == "BTC" else Decimal("0.01")
-        self.logger.info("Extended client 已初始化")
+    def _init_hotstuff(self):
+        pk = os.getenv("HOTSTUFF_PRIVATE_KEY")
+        if not pk:
+            raise ValueError("HOTSTUFF_PRIVATE_KEY not set")
+        wallet = Account.from_key(pk)
+        api_wallet_addr = wallet.address
+        self.hs_address = os.getenv("HOTSTUFF_ADDRESS", api_wallet_addr)
+        self.hs_exchange = ExchangeClient(wallet=wallet)
+        self.hs_info = InfoClient()
+        self.hs_symbol = f"{self.symbol}-PERP"
+        is_agent = self.hs_address.lower() != api_wallet_addr.lower()
+        self.logger.info(
+            f"HotStuff client 已初始化  "
+            f"{'agent模式' if is_agent else 'direct模式'}"
+            f"  main={self.hs_address[:10]}…  api={api_wallet_addr[:10]}…")
+
+    def _get_hotstuff_instrument_info(self):
+        from hotstuff.methods.info.market import InstrumentsParams
+        resp = self.hs_info.instruments(InstrumentsParams(type="perps"))
+        perps = resp.perps if hasattr(resp, "perps") else resp.get("perps", [])
+        for p in perps:
+            name = p.name if hasattr(p, "name") else p.get("name", "")
+            if name == self.hs_symbol:
+                pid = p.id if hasattr(p, "id") else p.get("id", 0)
+                tick = p.tick_size if hasattr(p, "tick_size") else p.get("tick_size", 0.01)
+                lot = p.lot_size if hasattr(p, "lot_size") else p.get("lot_size", 0.001)
+                max_lev = p.max_leverage if hasattr(p, "max_leverage") else p.get("max_leverage", 0)
+                self.hs_instrument_id = int(pid)
+                self.hs_tick_size = Decimal(str(tick))
+                self.hs_lot_size = Decimal(str(lot))
+                self.logger.info(
+                    f"HotStuff instrument: {self.hs_symbol} id={self.hs_instrument_id} "
+                    f"tick={self.hs_tick_size} lot={self.hs_lot_size} maxLev={max_lev}")
+                return
+        raise RuntimeError(f"{self.hs_symbol} not found on HotStuff")
 
     def _round_lighter(self, price: Decimal) -> Decimal:
         if self.lighter_tick > 0:
             return (price / self.lighter_tick).quantize(Decimal("1")) * self.lighter_tick
         return price
 
-    def _compute_jit_price(
-        self, side: str, l_bid: Decimal, l_ask: Decimal, mode: str,
-    ) -> Decimal:
-        """Compute JIT order price based on mode, with spread-crossing safety check.
-
-        Modes:
-          improve  — beat the current best by 1 tick (highest fill rate)
-          at_best  — join the queue at current best price
-          behind   — place 1 tick behind best (V32 legacy, most conservative)
-        """
-        if side == "sell":
-            if mode == "improve":
-                price = l_ask - self.lighter_tick
-                if price <= l_bid:
-                    price = l_ask
-            elif mode == "at_best":
-                price = l_ask
-            else:
-                price = l_ask + self.lighter_tick
-        else:
-            if mode == "improve":
-                price = l_bid + self.lighter_tick
-                if price >= l_ask:
-                    price = l_bid
-            elif mode == "at_best":
-                price = l_bid
-            else:
-                price = l_bid - self.lighter_tick
-        return self._round_lighter(price)
-
     # ─────────────────────────────────────────────
-    #  Extended BBO helper
+    #  HotStuff BBO helper
     # ─────────────────────────────────────────────
 
-    def _get_ext_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        if self.extended_client and self.extended_client.orderbook:
-            ob = self.extended_client.orderbook
-            bids = ob.get("bid", [])
-            asks = ob.get("ask", [])
-            bid = Decimal(bids[0]["p"]) if bids else None
-            ask = Decimal(asks[0]["p"]) if asks else None
-            return bid, ask
-        return None, None
+    def _refresh_hs_bbo(self):
+        """Pull latest BBO from HotstuffFeed into local cache."""
+        if self.hs_feed is None:
+            return
+        snap = self.hs_feed.snapshot
+        if snap and snap.connected and snap.best_bid > 0 and snap.best_ask > 0:
+            self._hs_best_bid = Decimal(str(snap.best_bid))
+            self._hs_best_ask = Decimal(str(snap.best_ask))
+            self._hs_bbo_ts = snap.timestamp
+            if snap.bids:
+                self._hs_l1_bid_size = snap.bids[0].size
+            if snap.asks:
+                self._hs_l1_ask_size = snap.asks[0].size
+
+    def _get_hs_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        self._refresh_hs_bbo()
+        return self._hs_best_bid, self._hs_best_ask
 
     # ─────────────────────────────────────────────
     #  V34: Lighter VWAP (uses full orderbook depth already in memory)
@@ -663,45 +702,55 @@ class SpreadArbBot:
 
         return available >= qty_f, available, slip_bps
 
+    def _check_lighter_open_depth(
+        self, side: str, qty: Decimal, max_levels: int = 2
+    ) -> tuple:
+        """V36: Check if Lighter top N levels have enough depth for taker open.
+
+        For buying: we eat asks.  For selling: we eat bids.
+        Returns (sufficient, available_qty, est_slip_bps, vwap_price).
+        """
+        if side == "buy":
+            book = self._l_ob.get("asks", {})
+            levels = sorted(book.items(), key=lambda x: x[0])[:max_levels]
+        else:
+            book = self._l_ob.get("bids", {})
+            levels = sorted(book.items(), key=lambda x: -x[0])[:max_levels]
+
+        available = sum(sz for _, sz in levels)
+        qty_f = float(qty)
+
+        slip_bps = 0.0
+        vwap_price = Decimal("0")
+        if levels and available > 0 and qty_f > 0:
+            filled = 0.0
+            cost = 0.0
+            for price, sz in levels:
+                take = min(sz, qty_f - filled)
+                cost += price * take
+                filled += take
+                if filled >= qty_f:
+                    break
+            vwap = cost / filled if filled > 0 else levels[0][0]
+            bbo = levels[0][0]
+            vwap_price = Decimal(str(round(vwap, 8)))
+            if side == "buy":
+                slip_bps = (vwap - bbo) / bbo * 10000 if bbo > 0 else 0.0
+            else:
+                slip_bps = (bbo - vwap) / bbo * 10000 if bbo > 0 else 0.0
+
+        return available >= qty_f, available, slip_bps, vwap_price
+
     # ─────────────────────────────────────────────
     #  V34: Dynamic entry threshold
     # ─────────────────────────────────────────────
 
-    def _estimate_extended_slip(self, side: str, qty: Decimal) -> float:
-        """Estimated Extended taker slippage (bps).
+    def _estimate_hotstuff_slip(self, side: str, qty: Decimal) -> float:
+        """Estimated HotStuff taker slippage (bps).
 
-        Uses depth-5 orderbook when available; otherwise falls back to a
-        conservative constant. Will be upgraded to a learned model once
-        enough realized-vs-BBO data accumulates.
+        HotstuffFeed only provides L1, so we return a conservative constant.
         """
-        ob = self.extended_client.orderbook if self.extended_client else None
-        if ob is None:
-            return 0.6
-        levels = ob.get("bid" if side == "sell" else "ask", [])
-        if len(levels) < 2:
-            return 0.6
-
-        remaining = float(qty)
-        total_value = 0.0
-        total_filled = 0.0
-        for lvl in levels:
-            if remaining <= 0:
-                break
-            p = float(lvl["p"])
-            q = float(lvl["q"])
-            fill = min(q, remaining)
-            total_value += p * fill
-            total_filled += fill
-            remaining -= fill
-
-        if total_filled <= 0:
-            return 0.6
-
-        vwap = total_value / total_filled
-        bbo_price = float(levels[0]["p"])
-        if bbo_price <= 0:
-            return 0.6
-        return abs(vwap - bbo_price) / bbo_price * 10000
+        return 0.5
 
     def _calc_dynamic_threshold(self, side: str, qty: Decimal,
                                current_spread_raw: float = 0.0) -> float:
@@ -711,8 +760,8 @@ class SpreadArbBot:
         cost (fee*2 + close_target + latency + ...), V35.1 uses:
           open_fee(1 leg) + expected_close_cost + capped_latency + slip + vol + edge
 
-        The closing strategy (_choose_hedge_mode + tiered execution) independently
-        optimises exit timing and costs.
+        The closing strategy uses depth-checked Taker IOC (same pattern as
+        opening), eliminating the multi-tier degradation chain.
 
         Returns max(static_floor, dynamic_cost) so that --open-spread always
         acts as a hard lower bound while the cost model can raise it higher.
@@ -722,8 +771,8 @@ class SpreadArbBot:
                       + self._ladder_level * self.ladder_step_bps
                       + self.spread_buffer_bps)
 
-        # ── V35.1: opening-leg fee only (Extended taker for hedge) ──
-        open_fee = float(FEE_EXTENDED_TAKER) * 10000       # 2.25 bps
+        # ── V35.1: opening-leg fee only (HotStuff taker) ──
+        open_fee = float(FEE_HOTSTUFF_TAKER) * 10000       # 2.5 bps
 
         # ── V35.1: expected close cost (replaces close_target + fee) ──
         exp_close = self.expected_close_cost                # default 0.8 bps
@@ -735,7 +784,7 @@ class SpreadArbBot:
         latency_cost = min(raw_lat, self.latency_cap)
 
         lighter_slip = max(self._estimate_lighter_slip(side, qty), 0.0)
-        ext_slip = max(self._estimate_extended_slip(
+        hs_slip = max(self._estimate_hotstuff_slip(
             "sell" if side == "buy" else "buy", qty), 0.0)
 
         vol_cost = self.vol_weight * self._short_vol_bps
@@ -745,7 +794,7 @@ class SpreadArbBot:
         inv_cost = self.inv_weight * inv_ratio * 2.0
 
         dynamic_cost = (open_fee + exp_close + latency_cost
-                        + lighter_slip + ext_slip + vol_cost + inv_cost
+                        + lighter_slip + hs_slip + vol_cost + inv_cost
                         + self.edge_buffer
                         + self._ladder_level * self.ladder_step_bps)
 
@@ -812,7 +861,7 @@ class SpreadArbBot:
 
     def _process_shadow_learning(self, now: float,
                                  l_bid: Decimal, l_ask: Decimal,
-                                 ext_bid: Decimal, ext_ask: Decimal):
+                                 hs_bid: Decimal, hs_ask: Decimal):
         """Consume matured shadow snapshots (>= 300ms old) and feed decay into trackers.
 
         This allows the latency tracker to warm up from passive market observation
@@ -824,13 +873,13 @@ class SpreadArbBot:
                 break
             self._shadow_snapshots.popleft()
 
-            if ext_ask <= 0 or l_ask <= 0:
+            if hs_ask <= 0 or l_ask <= 0:
                 continue
 
             if side == "sell":
-                current_bps = float((l_bid - ext_ask) / ext_ask * 10000)
+                current_bps = float((l_bid - hs_ask) / hs_ask * 10000)
             else:
-                current_bps = float((ext_bid - l_ask) / l_ask * 10000)
+                current_bps = float((hs_bid - l_ask) / l_ask * 10000)
 
             s_bkt = self._bucket_spread(obs_bps)
             v_bkt = self._bucket_vol(self._short_vol_bps)
@@ -849,82 +898,6 @@ class SpreadArbBot:
                 self.logger.info(
                     f"[Shadow] {side}/{s_bkt}/{v_bkt} 分桶tracker已热启动: "
                     f"{bkt_t.summary()}")
-
-    # ─────────────────────────────────────────────
-    #  V34: Choose close hedge mode based on residual edge
-    # ─────────────────────────────────────────────
-
-    def _choose_hedge_mode(self, basis_bps: float,
-                           l_bid: Decimal, l_ask: Decimal,
-                           ext_bid: Decimal, ext_ask: Decimal,
-                           qty: Decimal) -> HedgeMode:
-        """Select tiered close execution based on residual edge after all costs.
-
-        V35.1: This is the INDEPENDENT close-side cost model. It uses full
-        round-trip fee (fee_rt) because it evaluates the actual close-leg cost,
-        separate from the opening threshold (which was decoupled in V35.1).
-        """
-        fee_close = float(FEE_EXTENDED_TAKER) * 10000  # 2.25 bps (closing leg only, opening fee is sunk)
-
-        lighter_slip = (self._estimate_lighter_slip("sell", qty)
-                        + self._estimate_lighter_slip("buy", qty)) / 2
-        ext_slip = (self._estimate_extended_slip("sell", qty)
-                    + self._estimate_extended_slip("buy", qty)) / 2
-        lat_cost = (self.latency_pool.base["buy"].p75
-                    + self.latency_pool.base["sell"].p75) / 2
-        vol_cost = self.vol_weight * self._short_vol_bps * 0.5
-
-        residual = abs(basis_bps) - fee_close - lighter_slip - ext_slip - lat_cost - vol_cost
-
-        if residual > self.close_passive_edge:
-            return HedgeMode.PASSIVE
-        elif residual > self.close_aggressive_edge:
-            return HedgeMode.AGGRESSIVE
-        elif residual > 0:
-            return HedgeMode.FAST
-        else:
-            return HedgeMode.EMERGENCY
-
-    # ─────────────────────────────────────────────
-    #  Pricing engine
-    # ─────────────────────────────────────────────
-
-    def compute_maker_prices(
-        self, ext_bid: Decimal, ext_ask: Decimal,
-        l_bid: Decimal, l_ask: Decimal,
-    ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        """[Legacy] V32-era static maker price calculator.
-
-        NOT used by V34 entry path (which uses _calc_dynamic_threshold +
-        _compute_jit_price). Retained only for emergency_flatten / repair
-        compatibility.
-        """
-        effective_bps = (self.open_spread_bps
-                         + self._ladder_level * self.ladder_step_bps
-                         + self.spread_buffer_bps)
-        spread = Decimal(str(effective_bps)) / Decimal("10000")
-        basis = l_bid - ext_ask
-        basis_bps = float(basis / ext_ask * 10000) if ext_ask > 0 else 0
-
-        sell_price = None
-        if basis_bps > 0:
-            sell_target = ext_ask * (Decimal("1") + spread)
-            sell_price = self._round_lighter(sell_target)
-            if sell_price <= l_ask:
-                sell_price = l_ask + self.lighter_tick
-            if sell_price <= 0:
-                sell_price = None
-
-        buy_price = None
-        if basis_bps < -1.0:
-            buy_target = ext_bid * (Decimal("1") - spread)
-            buy_price = self._round_lighter(buy_target)
-            if buy_price >= l_bid:
-                buy_price = l_bid - self.lighter_tick
-            if buy_price <= 0:
-                buy_price = None
-
-        return buy_price, sell_price
 
     # ─────────────────────────────────────────────
     #  Lighter WS: order book + account orders
@@ -1110,7 +1083,7 @@ class SpreadArbBot:
             self._fill_price = avg_price
             self._fill_qty = filled_base
 
-            self._fill_ext_bid, self._fill_ext_ask = self._get_ext_bbo()
+            self._fill_hs_bid, self._fill_hs_ask = self._get_hs_bbo()
             self._fill_ts = time.time()
             self._instant_hedge_done.clear()
             self._instant_hedge_ok = False
@@ -1121,7 +1094,7 @@ class SpreadArbBot:
             self._fill_event.set()
             self.logger.info(
                 f"[Lighter] 成交: {side} {filled_base} @ {avg_price}  "
-                f"X_snap={self._fill_ext_bid}/{self._fill_ext_ask} → 即时对冲已触发")
+                f"HS_snap={self._fill_hs_bid}/{self._fill_hs_ask} → 即时对冲已触发")
 
         elif (is_our_buy or is_our_sell) and self._fill_event.is_set():
             # BUG-5 fix: 追加成交记录增量，HEDGING 中补充对冲
@@ -1358,74 +1331,89 @@ class SpreadArbBot:
             return False
 
     # ─────────────────────────────────────────────
-    #  Extended IOC hedge
+    #  HotStuff IOC hedge
     # ─────────────────────────────────────────────
 
-    def _on_extended_order_update(self, event: dict):
-        oid = str(event.get("order_id", ""))
-        status = event.get("status")
-
-        # IOC hedge tracking
-        if oid and self._x_ioc_pending_id and oid == str(self._x_ioc_pending_id):
-            filled = event.get("filled_size")
-            avg = event.get("avg_price")
-            if filled:
-                self._x_ioc_fill_qty = Decimal(str(filled))
-            if avg:
-                try:
-                    self._x_ioc_fill_price = Decimal(str(avg))
-                except Exception:
-                    pass
-            if status in ("FILLED", "CANCELED", "PARTIALLY_FILLED"):
-                self._x_ioc_confirmed.set()
-
-    async def _hedge_extended(self, side: str, qty: Decimal, ref_price: Decimal) -> Optional[Decimal]:
-        """Extended IOC 对冲。WS 确认由调用方在更高层级异步等待。"""
+    async def _hedge_hotstuff(self, side: str, qty: Decimal, ref_price: Decimal) -> Optional[Decimal]:
+        """HotStuff IOC 对冲 (乐观填充 — HotStuff 无 WS 订单事件)。"""
         slip = Decimal("0.005")
         if side == "buy":
             price = ref_price * (Decimal("1") + slip)
         else:
             price = ref_price * (Decimal("1") - slip)
-        price = price.quantize(self.extended_tick_size, rounding=ROUND_HALF_UP)
-        qty_r = qty.quantize(self.extended_min_order_size, rounding=ROUND_HALF_UP)
+        price = price.quantize(self.hs_tick_size, rounding=ROUND_HALF_UP)
+        qty_r = qty.quantize(self.hs_lot_size, rounding=ROUND_HALF_UP)
 
-        if qty_r < self.extended_min_order_size:
-            self.logger.warning(f"[Extended] 数量{qty_r}低于最小值{self.extended_min_order_size}, 跳过")
+        if qty_r < self.hs_lot_size:
+            self.logger.warning(f"[HotStuff] 数量{qty_r}低于最小值{self.hs_lot_size}, 跳过")
             return None
 
-        self._x_ioc_confirmed.clear()
-        self._x_ioc_fill_price = None
-        self._x_ioc_fill_qty = Decimal("0")
-        self._x_ioc_pending_id = None
+        hs_side = "b" if side == "buy" else "s"
 
         _t0 = time.time()
-        result = await self.extended_client.place_ioc_order(
-            contract_id=self.extended_contract_id,
-            quantity=qty_r,
-            side=side,
-            aggressive_price=price,
-        )
-        _t1 = time.time()
-        if not result.success:
-            self.logger.error(f"[Extended] IOC失败({(_t1-_t0)*1000:.0f}ms): {result.error_message}")
-            return None
+        try:
+            order = UnitOrder(
+                instrumentId=self.hs_instrument_id,
+                side=hs_side,
+                positionSide="BOTH",
+                price=str(price),
+                size=str(qty_r),
+                tif="IOC",
+                ro=False,
+                po=False,
+                isMarket=True,
+            )
+            params = PlaceOrderParams(
+                orders=[order],
+                expiresAfter=int(time.time() * 1000) + 60_000,
+            )
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self.hs_exchange.place_order, params)
 
-        if result.order_id:
-            self._x_ioc_pending_id = str(result.order_id)
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            if not isinstance(result, dict):
+                result = {"raw": result}
+
+            error = result.get("error", "")
+            if error:
+                self.logger.error(f"[HotStuff] IOC失败: {error}")
+                return None
+        except Exception as e:
+            self.logger.error(f"[HotStuff] IOC异常: {e}")
+            return None
+        _t1 = time.time()
 
         if side == "buy":
-            self.extended_position += qty_r
+            self.hotstuff_position += qty_r
         else:
-            self.extended_position -= qty_r
-
-        _actual_price = ref_price
-        if self._x_ioc_confirmed.is_set():
-            if self._x_ioc_fill_price and self._x_ioc_fill_price > 0:
-                _actual_price = self._x_ioc_fill_price
+            self.hotstuff_position -= qty_r
 
         _ms = (_t1 - _t0) * 1000
-        self.logger.info(f"[Extended] IOC完成({_ms:.0f}ms) 价={_actual_price}")
-        return _actual_price
+        self.logger.info(f"[HotStuff] IOC完成({_ms:.0f}ms) {side} {qty_r} ref={ref_price}")
+        return ref_price
+
+    async def _cancel_all_hotstuff_orders(self):
+        """Cancel all open orders on HotStuff."""
+        if self.dry_run or not self.hs_exchange:
+            return
+        try:
+            params = CancelAllParams(
+                expiresAfter=int(time.time() * 1000) + 60_000,
+            )
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self.hs_exchange.cancel_all, params)
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            if not isinstance(result, dict):
+                result = {}
+            cancelled = (result.get("data", {}) or {}).get("orders_cancelled", 0)
+            if cancelled:
+                self.logger.info(f"[HotStuff] 撤销 {cancelled} 挂单")
+        except Exception as e:
+            self.logger.warning(f"[HotStuff] cancel_all 失败: {e}")
 
     async def _instant_hedge_fire(self):
         """V22: 从WS回调触发的即时对冲, 跳过主循环延迟。含snapshot spread guard。"""
@@ -1433,27 +1421,27 @@ class SpreadArbBot:
             _side = self._fill_side
             _qty = self._fill_qty
             _l_price = self._fill_price
-            _ext_bid = self._fill_ext_bid
-            _ext_ask = self._fill_ext_ask
+            _hs_bid = self._fill_hs_bid
+            _hs_ask = self._fill_hs_ask
 
             if _side is None or _qty <= 0:
                 return
 
             _hedge_side = "sell" if _side == "buy" else "buy"
-            _ref = _ext_bid if _hedge_side == "sell" else _ext_ask
+            _ref = _hs_bid if _hedge_side == "sell" else _hs_ask
 
             if _ref is None or _ref <= 0:
                 _ref = _l_price
 
-            if _side == "sell" and _ext_ask and _ext_ask > 0:
-                _snap_spread = float((_l_price - _ext_ask) / _ext_ask * 10000)
-            elif _side == "buy" and _ext_bid and _ext_bid > 0:
-                _snap_spread = float((_ext_bid - _l_price) / _l_price * 10000)
+            if _side == "sell" and _hs_ask and _hs_ask > 0:
+                _snap_spread = float((_l_price - _hs_ask) / _hs_ask * 10000)
+            elif _side == "buy" and _hs_bid and _hs_bid > 0:
+                _snap_spread = float((_hs_bid - _l_price) / _l_price * 10000)
             else:
                 _snap_spread = 0
 
             _t0 = time.time()
-            _fill_price = await self._hedge_extended(_hedge_side, _qty, _ref)
+            _fill_price = await self._hedge_hotstuff(_hedge_side, _qty, _ref)
             _ms = (time.time() - _t0) * 1000
 
             self._instant_hedge_ms = _ms
@@ -1473,725 +1461,46 @@ class SpreadArbBot:
             self._instant_hedge_done.set()
 
     # ─────────────────────────────────────────────
-    #  Close position (spread convergence)
+    #  Close: PnL recording + ladder
     # ─────────────────────────────────────────────
-
-    async def _close_position(self, l_bid: Decimal, l_ask: Decimal,
-                               ext_bid: Decimal, ext_ask: Decimal) -> bool:
-        """[Legacy/V33] 逐层平仓: 直接taker IOC. 保留用于emergency_flatten回退。"""
-        self._in_flatten = True
-        if (self._l_buy_client_id or self._l_sell_client_id
-                or self._l_buy_order_idx or self._l_sell_order_idx):
-            await self._cancel_all_lighter()
-
-        l_qty = abs(self.lighter_position)
-        x_qty = abs(self.extended_position)
-        close_qty = min(l_qty, x_qty, self.order_size)
-
-        if close_qty < self.extended_min_order_size:
-            self._in_flatten = False
-            return False
-
-        close_qty = close_qty.quantize(self.extended_min_order_size, rounding=ROUND_DOWN)
-        if close_qty <= 0:
-            self._in_flatten = False
-            return False
-
-        if self.lighter_position < 0:
-            l_side = "buy"
-            x_side = "sell"
-            l_ref = l_ask
-            x_ref = ext_bid
-        else:
-            l_side = "sell"
-            x_side = "buy"
-            l_ref = l_bid
-            x_ref = ext_ask
-
-        _t0 = time.time()
-
-        # V33: 直接 taker IOC 平仓 — 数据证明比 JIT 更优（省0.8~1.1bps, 快2~7倍）
-        self._flatten_fill_event.clear()
-        self._flatten_fill_price = None
-        self._flatten_fill_qty = Decimal("0")
-        _flatten_cid = int(time.time() * 1000) * 10 + 8
-        self._flatten_ioc_cid = _flatten_cid
-
-        l_price = l_ref
-        slip = Decimal("0.005")
-        if l_side == "buy":
-            l_price = l_ref * (Decimal("1") + slip)
-        else:
-            l_price = l_ref * (Decimal("1") - slip)
-        l_price = self._round_lighter(l_price)
-
-        await self._lighter_rate_wait()
-        try:
-            _, _, err = await self.lighter_client.create_order(
-                market_index=self.lighter_market_index,
-                client_order_index=_flatten_cid,
-                base_amount=int(close_qty * self.base_amount_multiplier),
-                price=int(l_price * self.price_multiplier),
-                is_ask=(l_side == "sell"),
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,
-                reduce_only=True,
-                trigger_price=0,
-            )
-            if err:
-                self.logger.error(f"[平仓] Lighter taker失败: {err}")
-                self._in_flatten = False
-                return False
-            self.logger.info(
-                f"[平仓] L_{l_side} taker IOC {close_qty}@{l_price} (slip=0.5%)")
-        except Exception as e:
-            self.logger.error(f"[平仓] Lighter taker异常: {e}")
-            self._in_flatten = False
-            return False
-
-        if l_side == "buy":
-            self.lighter_position += close_qty
-        else:
-            self.lighter_position -= close_qty
-
-        # Extended taker平仓 (2.25bps)
-        ext_bid, ext_ask = self._get_ext_bbo()
-        x_ref = ext_bid if x_side == "sell" else ext_ask
-        x_fill = await self._hedge_extended(x_side, close_qty, x_ref)
-        if x_fill is None:
-            self.logger.error("[平仓] Extended对冲失败! 立即重试")
-            ext_bid, ext_ask = self._get_ext_bbo()
-            _retry_ref = ext_bid if x_side == "sell" else ext_ask
-            if _retry_ref and _retry_ref > 0:
-                for _r in range(2):
-                    await asyncio.sleep(0.2)
-                    x_fill = await self._hedge_extended(x_side, close_qty, _retry_ref)
-                    if x_fill is not None:
-                        self.logger.info(f"[平仓] Extended重试{_r+1}成功")
-                        break
-                    ext_bid, ext_ask = self._get_ext_bbo()
-                    if ext_bid and ext_ask:
-                        _retry_ref = ext_bid if x_side == "sell" else ext_ask
-            if x_fill is None:
-                self._consecutive_close_fails += 1
-                if self._consecutive_close_fails >= 2:
-                    self._circuit_breaker_until = time.time() + 120
-                    self.logger.error(
-                        f"[平仓] Extended连续{self._consecutive_close_fails}次失败! "
-                        f"熔断120秒, 禁止开仓")
-                # BUG-4 fix: Extended 全失败时，用 WS 实际成交量修正 Lighter 仓位
-                if not self._flatten_fill_event.is_set():
-                    try:
-                        await asyncio.wait_for(
-                            self._flatten_fill_event.wait(), timeout=0.3)
-                    except asyncio.TimeoutError:
-                        pass
-                _l_real = self._flatten_fill_qty if self._flatten_fill_qty > 0 else Decimal("0")
-                if _l_real != close_qty:
-                    _correction = close_qty - _l_real
-                    if l_side == "buy":
-                        self.lighter_position -= _correction
-                    else:
-                        self.lighter_position += _correction
-                    self.logger.warning(
-                        f"[平仓] X全失败, L仓位修正: 预期={close_qty} 实际={_l_real} 修正={_correction}")
-                self.logger.error("[平仓] Extended 3次全部失败! 进入REPAIR")
-                self._in_flatten = False
-                return False
-
-        # 两腿IOC都已发出, 现在统一等WS拿实际成交价(不影响执行速度)
-        _ws_tasks = []
-        if not self._flatten_fill_event.is_set():
-            _ws_tasks.append(asyncio.wait_for(
-                self._flatten_fill_event.wait(), timeout=0.5))
-        if not self._x_ioc_confirmed.is_set():
-            _ws_tasks.append(asyncio.wait_for(
-                self._x_ioc_confirmed.wait(), timeout=0.5))
-        if _ws_tasks:
-            await asyncio.gather(*_ws_tasks, return_exceptions=True)
-
-        _l_actual = l_ref
-        if self._flatten_fill_price and self._flatten_fill_price > 0:
-            _l_actual = self._flatten_fill_price
-
-        _x_actual = x_fill
-        if self._x_ioc_fill_price and self._x_ioc_fill_price > 0:
-            _x_actual = self._x_ioc_fill_price
-
-        # 仓位修正: 如果WS确认的实际成交量和预期不同, 用实际量修正
-        _l_real_qty = self._flatten_fill_qty if self._flatten_fill_qty > 0 else close_qty
-        if _l_real_qty != close_qty:
-            _diff = close_qty - _l_real_qty
-            if l_side == "buy":
-                self.lighter_position -= _diff
-            else:
-                self.lighter_position += _diff
-            self.logger.warning(
-                f"[平仓] Lighter部分成交: 预期={close_qty} 实际={_l_real_qty} → 仓位已修正")
-
-        _x_real_qty = self._x_ioc_fill_qty if self._x_ioc_fill_qty > 0 else close_qty
-        if _x_real_qty != close_qty:
-            _diff = close_qty - _x_real_qty
-            if x_side == "buy":
-                self.extended_position -= _diff
-            else:
-                self.extended_position += _diff
-            self.logger.warning(
-                f"[平仓] Extended部分成交: 预期={close_qty} 实际={_x_real_qty} → 仓位已修正")
-
-        _actual_qty = min(_l_real_qty, _x_real_qty)
-
-        _ms = (time.time() - _t0) * 1000
-        _x_price = Decimal(str(_x_actual))
-        if l_side == "buy":
-            _spread_bps = float((_l_actual - _x_price) / _x_price * 10000)
-        else:
-            _spread_bps = float((_x_price - _l_actual) / _l_actual * 10000)
-        _fee = float(FEE_EXTENDED_TAKER + FEE_LIGHTER_MAKER) * 10000
-        _net = -_spread_bps - _fee
-        self.cumulative_net_bps += _net
-        _dollar = float(_net / 10000 * float(_actual_qty) * float(_x_price))
-        self.cumulative_dollar_pnl += _dollar
-
-        self.logger.info(
-            f"[平仓完成] L_{l_side}@{_l_actual} X_{x_side}@{_x_actual}  "
-            f"close_spread={_spread_bps:.2f}bps fee={_fee:.2f}bps "
-            f"close_net={_net:.2f}bps  ${_dollar:+.4f}  {_ms:.0f}ms  "
-            f"累积=${self.cumulative_dollar_pnl:+.4f}")
-
-        # V23: 平仓后余额校验(异步, 不阻塞下一轮交易)
-        _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str = \
-            await self._v23_verify_close_pnl(
-                _net, _dollar, _actual_qty, Decimal(str(_x_actual)))
-
-        self._trade_seq += 1
-        self._csv_row([
-            datetime.now(_TZ_CN).isoformat(),
-            f"v35_close_{self._trade_seq:04d}",
-            f"close_{l_side}",
-            str(_l_actual), str(_x_actual), str(_actual_qty),
-            f"{_spread_bps:.2f}", f"{_fee:.2f}", f"{_net:.2f}",
-            f"{_ms:.0f}", f"{self.cumulative_net_bps:.2f}",
-            _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str,
-            f"{self._signal_observed_spread:.2f}",
-            f"{self._signal_executable_spread:.2f}",
-            f"{self._signal_latency_penalty:.2f}",
-            f"{self._signal_vol_bps:.2f}",
-            f"{self._signal_effective_bps:.2f}",
-            self._signal_hedge_mode,
-            self._signal_s_bucket, self._signal_v_bucket,
-            self._signal_d_bucket, self._signal_t_bucket,
-        ])
-        self._consecutive_close_fails = 0
-        # V32: 逐层平仓 — 每平1层降1级, 全平后归零
-        if self.ladder_step_bps > 0 and self._ladder_level > 0:
-            _old_level = self._ladder_level
-            self._ladder_level = max(0, self._ladder_level - 1)
-            self.logger.info(
-                f"[阶梯] 平仓1层, L{_old_level} → L{self._ladder_level}")
-
-        _still_has_pos = (abs(self.lighter_position) >= self.extended_min_order_size
-                          and abs(self.extended_position) >= self.extended_min_order_size)
-        if not _still_has_pos and self._ladder_level > 0:
-            self.logger.info(f"[阶梯] 全部平完, L{self._ladder_level} → L0")
-            self._ladder_level = 0
-
-        self._in_flatten = False
-        return True
-
-    # ─────────────────────────────────────────────
-    #  Batch close: 合并多层为1单, 减少延迟和价差流失
-    # ─────────────────────────────────────────────
-
-    async def _close_position_batch(
-        self, l_bid: Decimal, l_ask: Decimal,
-        ext_bid: Decimal, ext_ask: Decimal,
-        batch_qty: Decimal,
-    ) -> Tuple[bool, int]:
-        """合并平仓: 1个Lighter IOC + 1个Extended IOC, ~330ms完成。
-        返回 (成功与否, 实际平掉的层数)。"""
-        self._in_flatten = True
-        if (self._l_buy_client_id or self._l_sell_client_id
-                or self._l_buy_order_idx or self._l_sell_order_idx):
-            await self._cancel_all_lighter()
-
-        l_qty = abs(self.lighter_position)
-        x_qty = abs(self.extended_position)
-        close_qty = min(l_qty, x_qty, batch_qty)
-
-        if close_qty < self.extended_min_order_size:
-            self._in_flatten = False
-            return False, 0
-
-        close_qty = close_qty.quantize(self.extended_min_order_size, rounding=ROUND_DOWN)
-        if close_qty <= 0:
-            self._in_flatten = False
-            return False, 0
-
-        if self.lighter_position < 0:
-            l_side = "buy"
-            x_side = "sell"
-            l_ref = l_ask
-        else:
-            l_side = "sell"
-            x_side = "buy"
-            l_ref = l_bid
-
-        _t0 = time.time()
-
-        self._flatten_fill_event.clear()
-        self._flatten_fill_price = None
-        self._flatten_fill_qty = Decimal("0")
-        _flatten_cid = int(time.time() * 1000) * 10 + 9
-        self._flatten_ioc_cid = _flatten_cid
-
-        slip = Decimal("0.005")
-        if l_side == "buy":
-            l_price = l_ref * (Decimal("1") + slip)
-        else:
-            l_price = l_ref * (Decimal("1") - slip)
-        l_price = self._round_lighter(l_price)
-
-        _layers = int((close_qty / self.order_size).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP))
-        _layers = max(_layers, 1)
-
-        self.logger.info(
-            f"[批量平仓] L_{l_side} taker IOC {close_qty}@{l_price} "
-            f"({_layers}层合并, slip=0.5%)")
-
-        await self._lighter_rate_wait()
-        try:
-            _, _, err = await self.lighter_client.create_order(
-                market_index=self.lighter_market_index,
-                client_order_index=_flatten_cid,
-                base_amount=int(close_qty * self.base_amount_multiplier),
-                price=int(l_price * self.price_multiplier),
-                is_ask=(l_side == "sell"),
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,
-                reduce_only=True,
-                trigger_price=0,
-            )
-            if err:
-                self.logger.error(f"[批量平仓] Lighter taker失败: {err}")
-                self._in_flatten = False
-                return False, 0
-        except Exception as e:
-            self.logger.error(f"[批量平仓] Lighter taker异常: {e}")
-            self._in_flatten = False
-            return False, 0
-
-        if l_side == "buy":
-            self.lighter_position += close_qty
-        else:
-            self.lighter_position -= close_qty
-
-        ext_bid, ext_ask = self._get_ext_bbo()
-        x_ref = ext_bid if x_side == "sell" else ext_ask
-        x_fill = await self._hedge_extended(x_side, close_qty, x_ref)
-        if x_fill is None:
-            self.logger.error("[批量平仓] Extended对冲失败! 重试")
-            ext_bid, ext_ask = self._get_ext_bbo()
-            _retry_ref = ext_bid if x_side == "sell" else ext_ask
-            if _retry_ref and _retry_ref > 0:
-                for _r in range(2):
-                    await asyncio.sleep(0.2)
-                    x_fill = await self._hedge_extended(x_side, close_qty, _retry_ref)
-                    if x_fill is not None:
-                        self.logger.info(f"[批量平仓] Extended重试{_r+1}成功")
-                        break
-                    ext_bid, ext_ask = self._get_ext_bbo()
-                    if ext_bid and ext_ask:
-                        _retry_ref = ext_bid if x_side == "sell" else ext_ask
-            if x_fill is None:
-                self._consecutive_close_fails += 1
-                if self._consecutive_close_fails >= 2:
-                    self._circuit_breaker_until = time.time() + 120
-                    self.logger.error(
-                        f"[批量平仓] Extended连续{self._consecutive_close_fails}次失败! "
-                        f"熔断120秒")
-                if not self._flatten_fill_event.is_set():
-                    try:
-                        await asyncio.wait_for(
-                            self._flatten_fill_event.wait(), timeout=0.3)
-                    except asyncio.TimeoutError:
-                        pass
-                _l_real = self._flatten_fill_qty if self._flatten_fill_qty > 0 else Decimal("0")
-                if _l_real != close_qty:
-                    _correction = close_qty - _l_real
-                    if l_side == "buy":
-                        self.lighter_position -= _correction
-                    else:
-                        self.lighter_position += _correction
-                    self.logger.warning(
-                        f"[批量平仓] X全失败, L仓位修正: 预期={close_qty} 实际={_l_real}")
-                self.logger.error("[批量平仓] Extended全部失败! 进入REPAIR")
-                self._in_flatten = False
-                return False, 0
-
-        _ws_tasks = []
-        if not self._flatten_fill_event.is_set():
-            _ws_tasks.append(asyncio.wait_for(
-                self._flatten_fill_event.wait(), timeout=0.5))
-        if not self._x_ioc_confirmed.is_set():
-            _ws_tasks.append(asyncio.wait_for(
-                self._x_ioc_confirmed.wait(), timeout=0.5))
-        if _ws_tasks:
-            await asyncio.gather(*_ws_tasks, return_exceptions=True)
-
-        _l_actual = l_ref
-        if self._flatten_fill_price and self._flatten_fill_price > 0:
-            _l_actual = self._flatten_fill_price
-
-        _x_actual = x_fill
-        if self._x_ioc_fill_price and self._x_ioc_fill_price > 0:
-            _x_actual = self._x_ioc_fill_price
-
-        _l_real_qty = self._flatten_fill_qty if self._flatten_fill_qty > 0 else close_qty
-        if _l_real_qty != close_qty:
-            _diff = close_qty - _l_real_qty
-            if l_side == "buy":
-                self.lighter_position -= _diff
-            else:
-                self.lighter_position += _diff
-            self.logger.warning(
-                f"[批量平仓] Lighter部分成交: 预期={close_qty} 实际={_l_real_qty}")
-
-        _x_real_qty = self._x_ioc_fill_qty if self._x_ioc_fill_qty > 0 else close_qty
-        if _x_real_qty != close_qty:
-            _diff = close_qty - _x_real_qty
-            if x_side == "buy":
-                self.extended_position -= _diff
-            else:
-                self.extended_position += _diff
-            self.logger.warning(
-                f"[批量平仓] Extended部分成交: 预期={close_qty} 实际={_x_real_qty}")
-
-        _actual_qty = min(_l_real_qty, _x_real_qty)
-
-        _ms = (time.time() - _t0) * 1000
-        _x_price = Decimal(str(_x_actual))
-        if l_side == "buy":
-            _spread_bps = float((_l_actual - _x_price) / _x_price * 10000)
-        else:
-            _spread_bps = float((_x_price - _l_actual) / _l_actual * 10000)
-        _fee = float(FEE_EXTENDED_TAKER + FEE_LIGHTER_MAKER) * 10000
-        _net = -_spread_bps - _fee
-        self.cumulative_net_bps += _net
-        _dollar = float(_net / 10000 * float(_actual_qty) * float(_x_price))
-        self.cumulative_dollar_pnl += _dollar
-
-        self.logger.info(
-            f"[批量平仓完成] L_{l_side}@{_l_actual} X_{x_side}@{_x_actual}  "
-            f"{_layers}层合并 qty={_actual_qty}  "
-            f"close_spread={_spread_bps:.2f}bps fee={_fee:.2f}bps "
-            f"close_net={_net:.2f}bps  ${_dollar:+.4f}  {_ms:.0f}ms  "
-            f"累积=${self.cumulative_dollar_pnl:+.4f}")
-
-        _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str = \
-            await self._v23_verify_close_pnl(
-                _net, _dollar, _actual_qty, Decimal(str(_x_actual)))
-
-        self._trade_seq += 1
-        self._csv_row([
-            datetime.now(_TZ_CN).isoformat(),
-            f"v35_bclose_{self._trade_seq:04d}",
-            f"close_{l_side}",
-            str(_l_actual), str(_x_actual), str(_actual_qty),
-            f"{_spread_bps:.2f}", f"{_fee:.2f}", f"{_net:.2f}",
-            f"{_ms:.0f}", f"{self.cumulative_net_bps:.2f}",
-            _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str,
-            f"{self._signal_observed_spread:.2f}",
-            f"{self._signal_executable_spread:.2f}",
-            f"{self._signal_latency_penalty:.2f}",
-            f"{self._signal_vol_bps:.2f}",
-            f"{self._signal_effective_bps:.2f}",
-            self._signal_hedge_mode,
-            self._signal_s_bucket, self._signal_v_bucket,
-            self._signal_d_bucket, self._signal_t_bucket,
-        ])
-        self._consecutive_close_fails = 0
-
-        _closed_layers = int((_actual_qty / self.order_size).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP))
-        _closed_layers = max(_closed_layers, 1)
-        if self.ladder_step_bps > 0 and self._ladder_level > 0:
-            _old_level = self._ladder_level
-            self._ladder_level = max(0, self._ladder_level - _closed_layers)
-            self.logger.info(
-                f"[阶梯] 批量平{_closed_layers}层, L{_old_level} → L{self._ladder_level}")
-
-        _still_has_pos = (abs(self.lighter_position) >= self.extended_min_order_size
-                          and abs(self.extended_position) >= self.extended_min_order_size)
-        if not _still_has_pos and self._ladder_level > 0:
-            self.logger.info(f"[阶梯] 全部平完, L{self._ladder_level} → L0")
-            self._ladder_level = 0
-
-        self._in_flatten = False
-        return True, _closed_layers
-
-    # ─────────────────────────────────────────────
-    #  V34: Tiered close — Passive maker & Aggressive limit
-    # ─────────────────────────────────────────────
-
-    async def _close_position_passive(
-        self, l_bid: Decimal, l_ask: Decimal,
-        ext_bid: Decimal, ext_ask: Decimal,
-        batch_qty: Decimal,
-    ) -> Tuple[bool, int]:
-        """Mode A: Lighter passive maker close, wait for fill, then hedge Extended.
-        Falls back to _close_position_aggressive on timeout."""
-        self._in_flatten = True
-        if (self._l_buy_client_id or self._l_sell_client_id
-                or self._l_buy_order_idx or self._l_sell_order_idx):
-            await self._cancel_all_lighter()
-
-        l_qty = abs(self.lighter_position)
-        x_qty = abs(self.extended_position)
-        close_qty = min(l_qty, x_qty, batch_qty)
-        close_qty = close_qty.quantize(self.extended_min_order_size, rounding=ROUND_DOWN)
-        if close_qty < self.extended_min_order_size or close_qty <= 0:
-            self._in_flatten = False
-            return False, 0
-
-        if self.lighter_position < 0:
-            l_side = "buy"
-            x_side = "sell"
-        else:
-            l_side = "sell"
-            x_side = "buy"
-
-        jit_price = self._compute_jit_price(
-            l_side, l_bid, l_ask, self.close_jit_price_mode)
-        if jit_price is None or jit_price <= 0:
-            self._in_flatten = False
-            return await self._close_position_aggressive(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        self.logger.info(
-            f"[平仓Passive] L_{l_side} maker {close_qty}@{jit_price} "
-            f"({self.close_jit_price_mode}) → 等{self.close_jit_wait}s")
-
-        self._flatten_fill_event.clear()
-        self._flatten_fill_price = None
-        self._flatten_fill_qty = Decimal("0")
-        _flatten_cid = int(time.time() * 1000) * 10 + 7
-        self._flatten_ioc_cid = _flatten_cid
-
-        await self._lighter_rate_wait()
-        try:
-            _, _, err = await self.lighter_client.create_order(
-                market_index=self.lighter_market_index,
-                client_order_index=_flatten_cid,
-                base_amount=int(close_qty * self.base_amount_multiplier),
-                price=int(jit_price * self.price_multiplier),
-                is_ask=(l_side == "sell"),
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                order_expiry=int((time.time() + 600) * 1000),
-                reduce_only=True,
-                trigger_price=0,
-            )
-            if err:
-                self.logger.warning(f"[平仓Passive] Lighter maker失败: {err} → 降级aggressive")
-                self._in_flatten = False
-                return await self._close_position_aggressive(
-                    l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-        except Exception as e:
-            self.logger.warning(f"[平仓Passive] Lighter maker异常: {e} → 降级aggressive")
-            self._in_flatten = False
-            return await self._close_position_aggressive(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        _filled = False
-        try:
-            await asyncio.wait_for(
-                self._flatten_fill_event.wait(), timeout=self.close_jit_wait)
-            _filled = self._flatten_fill_event.is_set()
-        except asyncio.TimeoutError:
-            pass
-
-        if not _filled:
-            await self._cancel_all_lighter()
-            await asyncio.sleep(0.05)
-            _filled = self._flatten_fill_event.is_set()
-
-        if not _filled:
-            self.logger.info(
-                f"[平仓Passive] {self.close_jit_wait}s未成交 → 降级aggressive")
-            self._in_flatten = False
-            return await self._close_position_aggressive(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        _l_actual = self._flatten_fill_price if self._flatten_fill_price else jit_price
-        _fill_qty = self._flatten_fill_qty if self._flatten_fill_qty > 0 else close_qty
-        if l_side == "buy":
-            self.lighter_position += _fill_qty
-        else:
-            self.lighter_position -= _fill_qty
-
-        _t0 = time.time()
-        ext_bid, ext_ask = self._get_ext_bbo()
-        x_ref = ext_bid if x_side == "sell" else ext_ask
-        x_fill = await self._hedge_extended(x_side, _fill_qty, x_ref)
-        if x_fill is None:
-            self.logger.error("[平仓Passive] Extended对冲失败! → REPAIR")
-            self._in_flatten = False
-            return False, 0
-        _ms = (time.time() - _t0) * 1000
-
-        self._in_flatten = False
-        return await self._close_record_and_ladder(
-            l_side, x_side, _l_actual, x_fill, _fill_qty, _ms, "passive")
-
-    async def _close_position_aggressive(
-        self, l_bid: Decimal, l_ask: Decimal,
-        ext_bid: Decimal, ext_ask: Decimal,
-        batch_qty: Decimal,
-    ) -> Tuple[bool, int]:
-        """Mode B: Lighter improve/at_best short wait, then fallback to taker IOC."""
-        self._in_flatten = True
-        if (self._l_buy_client_id or self._l_sell_client_id
-                or self._l_buy_order_idx or self._l_sell_order_idx):
-            await self._cancel_all_lighter()
-
-        l_qty = abs(self.lighter_position)
-        x_qty = abs(self.extended_position)
-        close_qty = min(l_qty, x_qty, batch_qty)
-        close_qty = close_qty.quantize(self.extended_min_order_size, rounding=ROUND_DOWN)
-        if close_qty < self.extended_min_order_size or close_qty <= 0:
-            self._in_flatten = False
-            return False, 0
-
-        if self.lighter_position < 0:
-            l_side = "buy"
-            x_side = "sell"
-        else:
-            l_side = "sell"
-            x_side = "buy"
-
-        jit_price = self._compute_jit_price(l_side, l_bid, l_ask, "improve")
-        if jit_price is None or jit_price <= 0:
-            self._in_flatten = False
-            return await self._close_position_batch(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        _agg_wait = 0.8
-        self.logger.info(
-            f"[平仓Aggressive] L_{l_side} improve {close_qty}@{jit_price} → 等{_agg_wait}s")
-
-        self._flatten_fill_event.clear()
-        self._flatten_fill_price = None
-        self._flatten_fill_qty = Decimal("0")
-        _flatten_cid = int(time.time() * 1000) * 10 + 6
-        self._flatten_ioc_cid = _flatten_cid
-
-        await self._lighter_rate_wait()
-        try:
-            _, _, err = await self.lighter_client.create_order(
-                market_index=self.lighter_market_index,
-                client_order_index=_flatten_cid,
-                base_amount=int(close_qty * self.base_amount_multiplier),
-                price=int(jit_price * self.price_multiplier),
-                is_ask=(l_side == "sell"),
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                order_expiry=int((time.time() + 600) * 1000),
-                reduce_only=True,
-                trigger_price=0,
-            )
-            if err:
-                self.logger.warning(f"[平仓Aggressive] Lighter失败: {err} → 降级batch taker")
-                self._in_flatten = False
-                return await self._close_position_batch(
-                    l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-        except Exception as e:
-            self.logger.warning(f"[平仓Aggressive] Lighter异常: {e} → 降级batch taker")
-            self._in_flatten = False
-            return await self._close_position_batch(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        _filled = False
-        try:
-            await asyncio.wait_for(
-                self._flatten_fill_event.wait(), timeout=_agg_wait)
-            _filled = self._flatten_fill_event.is_set()
-        except asyncio.TimeoutError:
-            pass
-
-        if not _filled:
-            await self._cancel_all_lighter()
-            await asyncio.sleep(0.05)
-            _filled = self._flatten_fill_event.is_set()
-
-        if not _filled:
-            self.logger.info(
-                f"[平仓Aggressive] {_agg_wait}s未成交 → 降级batch taker IOC")
-            self._in_flatten = False
-            return await self._close_position_batch(
-                l_bid, l_ask, ext_bid, ext_ask, batch_qty)
-
-        _l_actual = self._flatten_fill_price if self._flatten_fill_price else jit_price
-        _fill_qty = self._flatten_fill_qty if self._flatten_fill_qty > 0 else close_qty
-        if l_side == "buy":
-            self.lighter_position += _fill_qty
-        else:
-            self.lighter_position -= _fill_qty
-
-        _t0 = time.time()
-        ext_bid, ext_ask = self._get_ext_bbo()
-        x_ref = ext_bid if x_side == "sell" else ext_ask
-        x_fill = await self._hedge_extended(x_side, _fill_qty, x_ref)
-        if x_fill is None:
-            self.logger.error("[平仓Aggressive] Extended对冲失败! → REPAIR")
-            self._in_flatten = False
-            return False, 0
-        _ms = (time.time() - _t0) * 1000
-
-        self._in_flatten = False
-        return await self._close_record_and_ladder(
-            l_side, x_side, _l_actual, x_fill, _fill_qty, _ms, "aggressive")
 
     async def _close_record_and_ladder(
-        self, l_side: str, x_side: str,
-        l_actual: Decimal, x_fill: Decimal,
+        self, l_side: str, hs_side: str,
+        l_actual: Decimal, hs_fill: Decimal,
         actual_qty: Decimal, hedge_ms: float,
         mode_label: str,
     ) -> Tuple[bool, int]:
-        """Shared PnL recording + ladder adjustment for passive/aggressive/emergency close."""
-        _x_price = Decimal(str(x_fill))
+        """Shared PnL recording + ladder adjustment for taker close."""
+        _hs_price = Decimal(str(hs_fill))
         if l_side == "buy":
-            _spread_bps = float((l_actual - _x_price) / _x_price * 10000)
+            _spread_bps = float((l_actual - _hs_price) / _hs_price * 10000)
         else:
-            _spread_bps = float((_x_price - l_actual) / l_actual * 10000)
-        _fee = float(FEE_EXTENDED_TAKER + FEE_LIGHTER_MAKER) * 10000
+            _spread_bps = float((_hs_price - l_actual) / l_actual * 10000)
+        _fee = float(FEE_HOTSTUFF_TAKER + FEE_LIGHTER_MAKER) * 10000
         _net = -_spread_bps - _fee
         self.cumulative_net_bps += _net
         _dollar = float(_net / 10000 * float(actual_qty) * float(_x_price))
         self.cumulative_dollar_pnl += _dollar
 
         self.logger.info(
-            f"[平仓{mode_label}完成] L_{l_side}@{l_actual} X_{x_side}@{x_fill}  "
+            f"[平仓{mode_label}完成] L_{l_side}@{l_actual} HS_{hs_side}@{hs_fill}  "
             f"close_spread={_spread_bps:.2f}bps fee={_fee:.2f}bps "
             f"close_net={_net:.2f}bps  ${_dollar:+.4f}  hedge={hedge_ms:.0f}ms  "
             f"累积=${self.cumulative_dollar_pnl:+.4f}")
 
-        _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str = \
+        _real_pnl_str, _cum_real_str, _bal_l_str, _bal_hs_str = \
             await self._v23_verify_close_pnl(
-                _net, _dollar, actual_qty, _x_price)
+                _net, _dollar, actual_qty, _hs_price)
 
         self._trade_seq += 1
         self._csv_row([
             datetime.now(_TZ_CN).isoformat(),
-            f"v35_close_{self._trade_seq:04d}",
+            f"hs_l_v36_close_{self._trade_seq:04d}",
             f"close_{l_side}",
-            str(l_actual), str(x_fill), str(actual_qty),
+            str(l_actual), str(hs_fill), str(actual_qty),
             f"{_spread_bps:.2f}", f"{_fee:.2f}", f"{_net:.2f}",
             f"{hedge_ms:.0f}", f"{self.cumulative_net_bps:.2f}",
-            _real_pnl_str, _cum_real_str, _bal_l_str, _bal_x_str,
+            _real_pnl_str, _cum_real_str, _bal_l_str, _bal_hs_str,
             f"{self._signal_observed_spread:.2f}",
             f"{self._signal_executable_spread:.2f}",
             f"{self._signal_latency_penalty:.2f}",
@@ -2211,20 +1520,20 @@ class SpreadArbBot:
             self.logger.info(
                 f"[阶梯] {mode_label}平{_closed_layers}层, L{_old} → L{self._ladder_level}")
 
-        _still = (abs(self.lighter_position) >= self.extended_min_order_size
-                  and abs(self.extended_position) >= self.extended_min_order_size)
+        _still = (abs(self.lighter_position) >= self.hs_lot_size
+                  and abs(self.hotstuff_position) >= self.hs_lot_size)
         if not _still and self._ladder_level > 0:
             self.logger.info(f"[阶梯] 全部平完, L{self._ladder_level} → L0")
             self._ladder_level = 0
 
         return True, _closed_layers
 
-    async def _close_position_emergency(
+    async def _close_position_taker(
         self, l_bid: Decimal, l_ask: Decimal,
-        ext_bid: Decimal, ext_ask: Decimal,
+        hs_bid: Decimal, hs_ask: Decimal,
         batch_qty: Decimal,
     ) -> Tuple[bool, int]:
-        """Mode D: Maximum-aggression close — wider slip, no waiting, immediate hedge.
+        """V36 unified close: depth-checked Taker IOC on Lighter + hedge HotStuff.
         Falls back to _emergency_flatten() on failure."""
         self._in_flatten = True
         if (self._l_buy_client_id or self._l_sell_client_id
@@ -2232,20 +1541,20 @@ class SpreadArbBot:
             await self._cancel_all_lighter()
 
         l_qty = abs(self.lighter_position)
-        x_qty = abs(self.extended_position)
-        close_qty = min(l_qty, x_qty, batch_qty)
-        close_qty = close_qty.quantize(self.extended_min_order_size, rounding=ROUND_DOWN)
-        if close_qty < self.extended_min_order_size or close_qty <= 0:
+        hs_qty = abs(self.hotstuff_position)
+        close_qty = min(l_qty, hs_qty, batch_qty)
+        close_qty = close_qty.quantize(self.hs_lot_size, rounding=ROUND_DOWN)
+        if close_qty < self.hs_lot_size or close_qty <= 0:
             self._in_flatten = False
             return False, 0
 
         if self.lighter_position < 0:
             l_side = "buy"
-            x_side = "sell"
+            hs_side = "sell"
             l_ref = l_ask
         else:
             l_side = "sell"
-            x_side = "buy"
+            hs_side = "buy"
             l_ref = l_bid
 
         _t0 = time.time()
@@ -2256,7 +1565,6 @@ class SpreadArbBot:
         _flatten_cid = int(time.time() * 1000) * 10 + 5
         self._flatten_ioc_cid = _flatten_cid
 
-        # Wider slip than normal batch (1% vs 0.5%)
         slip = Decimal("0.01")
         if l_side == "buy":
             l_price = l_ref * (Decimal("1") + slip)
@@ -2265,7 +1573,7 @@ class SpreadArbBot:
         l_price = self._round_lighter(l_price)
 
         self.logger.info(
-            f"[平仓Emergency] L_{l_side} IOC {close_qty}@{l_price} (slip=1%)")
+            f"[平仓Taker] L_{l_side} IOC {close_qty}@{l_price} (slip=1%)")
 
         await self._lighter_rate_wait()
         try:
@@ -2282,12 +1590,12 @@ class SpreadArbBot:
                 trigger_price=0,
             )
             if err:
-                self.logger.error(f"[平仓Emergency] Lighter IOC失败: {err} → _emergency_flatten")
+                self.logger.error(f"[平仓Taker] Lighter IOC失败: {err} → _emergency_flatten")
                 self._in_flatten = False
                 await self._emergency_flatten()
                 return False, 0
         except Exception as e:
-            self.logger.error(f"[平仓Emergency] Lighter异常: {e} → _emergency_flatten")
+            self.logger.error(f"[平仓Taker] Lighter异常: {e} → _emergency_flatten")
             self._in_flatten = False
             await self._emergency_flatten()
             return False, 0
@@ -2297,11 +1605,11 @@ class SpreadArbBot:
         else:
             self.lighter_position -= close_qty
 
-        ext_bid, ext_ask = self._get_ext_bbo()
-        x_ref = ext_bid if x_side == "sell" else ext_ask
-        x_fill = await self._hedge_extended(x_side, close_qty, x_ref)
-        if x_fill is None:
-            self.logger.error("[平仓Emergency] Extended对冲失败! → _emergency_flatten")
+        hs_bid, hs_ask = self._get_hs_bbo()
+        hs_ref = hs_bid if hs_side == "sell" else hs_ask
+        hs_fill = await self._hedge_hotstuff(hs_side, close_qty, hs_ref)
+        if hs_fill is None:
+            self.logger.error("[平仓Taker] HotStuff对冲失败! → _emergency_flatten")
             self._in_flatten = False
             await self._emergency_flatten()
             return False, 0
@@ -2313,7 +1621,7 @@ class SpreadArbBot:
 
         self._in_flatten = False
         return await self._close_record_and_ladder(
-            l_side, x_side, _l_actual, x_fill, close_qty, _ms, "emergency")
+            l_side, hs_side, _l_actual, hs_fill, close_qty, _ms, "taker")
 
     # ─────────────────────────────────────────────
     #  V23: Balance query helpers (余额校验)
@@ -2344,22 +1652,13 @@ class SpreadArbBot:
             self.logger.warning(f"[余额] Lighter余额查询失败: {e}")
             return None
 
-    async def _get_extended_balance(self) -> Optional[Decimal]:
-        try:
-            bal_resp = await self.extended_client.perpetual_trading_client.account.get_balance()
-            if bal_resp and hasattr(bal_resp, "data") and bal_resp.data:
-                return bal_resp.data.equity
-            return None
-        except Exception as e:
-            self.logger.warning(f"[余额] Extended余额查询失败: {e}")
-            return None
+    async def _get_hotstuff_balance(self) -> Optional[Decimal]:
+        """HotStuff has no direct balance API; return None (use Lighter balance only)."""
+        return None
 
     async def _snapshot_balances(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        l_bal, x_bal = await asyncio.gather(
-            self._get_lighter_balance(),
-            self._get_extended_balance(),
-        )
-        return l_bal, x_bal
+        l_bal = await self._get_lighter_balance()
+        return l_bal, None
 
     # ─────────────────────────────────────────────
     #  Position helpers
@@ -2387,22 +1686,25 @@ class SpreadArbBot:
             self.logger.warning(f"获取Lighter仓位失败: {e}")
             return self.lighter_position
 
-    async def _get_extended_position(self) -> Decimal:
+    async def _get_hotstuff_position(self) -> Decimal:
         try:
-            positions_data = await self.extended_client.perpetual_trading_client.account.get_positions(
-                market_names=[self.extended_contract_id])
-            if not positions_data or not hasattr(positions_data, "data") or not positions_data.data:
+            loop = asyncio.get_event_loop()
+            positions = await loop.run_in_executor(
+                None,
+                self.hs_info.positions,
+                PositionsParams(user=self.hs_address),
+            )
+            if not positions:
                 return Decimal("0")
-            for p in positions_data.data:
-                if p.market == self.extended_contract_id:
-                    size = Decimal(str(p.size))
-                    if str(p.side).upper() == "SHORT":
-                        return -size
-                    return size
+            for p in positions:
+                inst = p.get("instrument") if isinstance(p, dict) else getattr(p, "instrument", None)
+                if inst == self.hs_symbol:
+                    size_str = p.get("size") if isinstance(p, dict) else getattr(p, "size", "0")
+                    return Decimal(str(size_str))
             return Decimal("0")
         except Exception as e:
-            self.logger.warning(f"获取Extended仓位失败: {e}")
-            return self.extended_position
+            self.logger.warning(f"获取HotStuff仓位失败: {e}")
+            return self.hotstuff_position
 
     async def _reconcile(self):
         if self._instant_hedge_task and not self._instant_hedge_task.done():
@@ -2412,34 +1714,34 @@ class SpreadArbBot:
             except asyncio.TimeoutError:
                 self.logger.warning("[对账] 即时对冲超时, 继续对账")
         l = await self._get_lighter_position()
-        x = await self._get_extended_position()
-        _old_l, _old_x = self.lighter_position, self.extended_position
+        h = await self._get_hotstuff_position()
+        _old_l, _old_h = self.lighter_position, self.hotstuff_position
         self.lighter_position = l
-        self.extended_position = x
-        net = abs(l + x)
-        if _old_l != l or _old_x != x:
+        self.hotstuff_position = h
+        net = abs(l + h)
+        if _old_l != l or _old_h != h:
             self.logger.info(
-                f"[对账] 仓位同步: L {_old_l}→{l}  X {_old_x}→{x}")
+                f"[对账] 仓位同步: L {_old_l}→{l}  HS {_old_h}→{h}")
         if net > self.order_size * Decimal("0.5"):
-            self.logger.warning(f"[对账] 不平衡: L={l} X={x} net={net}")
+            self.logger.warning(f"[对账] 不平衡: L={l} HS={h} net={net}")
         return net < self.order_size * Decimal("2")
 
     async def _emergency_flatten(self):
         self.logger.error("[紧急平仓] 开始...")
         self._in_flatten = True
 
-        # 1. 先撤掉所有 Lighter 挂单
+        # 1. 撤掉所有挂单
         await self._cancel_all_lighter()
+        await self._cancel_all_hotstuff_orders()
 
         # 2. 对账获取真实仓位
         await self._reconcile()
 
         # 3. 平 Lighter 仓位
-        if abs(self.lighter_position) >= self.extended_min_order_size:
+        if abs(self.lighter_position) >= self.hs_lot_size:
             side = "sell" if self.lighter_position > 0 else "buy"
             qty = abs(self.lighter_position)
             ref = self._l_best_bid if side == "sell" else self._l_best_ask
-            # ISSUE-7 fix: 无 BBO 时用对手方价格 ±1% 作为兜底
             if (ref is None or ref <= 0):
                 _fallback = self._l_best_ask if side == "sell" else self._l_best_bid
                 if _fallback and _fallback > 0:
@@ -2476,42 +1778,34 @@ class SpreadArbBot:
             else:
                 self.logger.error(f"[紧急平仓] Lighter完全无BBO, 无法平仓!")
 
-        # 4. 平 Extended 仓位
-        if abs(self.extended_position) >= self.extended_min_order_size:
-            side = "sell" if self.extended_position > 0 else "buy"
-            qty = abs(self.extended_position)
-            ext_bid, ext_ask = self._get_ext_bbo()
-            ref = ext_bid if side == "sell" else ext_ask
-            # ISSUE-7 fix: 无 BBO 时用对手方价格 ±1% 作为兜底
+        # 4. 平 HotStuff 仓位
+        if abs(self.hotstuff_position) >= self.hs_lot_size:
+            side = "sell" if self.hotstuff_position > 0 else "buy"
+            qty = abs(self.hotstuff_position)
+            hs_bid, hs_ask = self._get_hs_bbo()
+            ref = hs_bid if side == "sell" else hs_ask
             if (ref is None or ref <= 0):
-                _fallback = ext_ask if side == "sell" else ext_bid
+                _fallback = hs_ask if side == "sell" else hs_bid
                 if _fallback and _fallback > 0:
                     ref = _fallback * (Decimal("0.99") if side == "sell" else Decimal("1.01"))
-                    self.logger.warning(f"[紧急平仓] Extended无{('bid' if side=='sell' else 'ask')}, 用对手方兜底: {ref}")
+                    self.logger.warning(f"[紧急平仓] HotStuff无{('bid' if side=='sell' else 'ask')}, 用对手方兜底: {ref}")
             if ref and ref > 0:
-                price = ref * (Decimal("0.99") if side == "sell" else Decimal("1.01"))
-                result = await self.extended_client.place_ioc_order(
-                    contract_id=self.extended_contract_id,
-                    quantity=qty, side=side, aggressive_price=price)
-                if result.success:
-                    if side == "sell":
-                        self.extended_position -= qty
-                    else:
-                        self.extended_position += qty
-                    self.logger.info(f"[紧急平仓] Extended {side} {qty} 已发送")
+                _fill = await self._hedge_hotstuff(side, qty, ref)
+                if _fill is not None:
+                    self.logger.info(f"[紧急平仓] HotStuff {side} {qty} 已发送")
                 else:
-                    self.logger.error(f"[紧急平仓] Extended失败: {result.error_message}")
+                    self.logger.error(f"[紧急平仓] HotStuff IOC失败!")
             else:
-                self.logger.error(f"[紧急平仓] Extended完全无BBO, 无法平仓!")
+                self.logger.error(f"[紧急平仓] HotStuff完全无BBO, 无法平仓!")
 
         await asyncio.sleep(1.0)
         if not self.stop_flag:
             await self._reconcile()
-            _net_after = abs(self.lighter_position + self.extended_position)
-            if _net_after >= self.extended_min_order_size:
+            _net_after = abs(self.lighter_position + self.hotstuff_position)
+            if _net_after >= self.hs_lot_size:
                 self.logger.warning(
                     f"[紧急平仓] 第一次对账后仍有偏差={_net_after}, 第二次尝试修复")
-                _net = self.lighter_position + self.extended_position
+                _net = self.lighter_position + self.hotstuff_position
                 if _net < 0:
                     _ref = self._l_best_ask if self._l_best_ask else Decimal("0")
                     if _ref > 0:
@@ -2527,7 +1821,7 @@ class SpreadArbBot:
             self._ladder_level = 0
         self._in_flatten = False
         self._stale_fills.clear()
-        self.logger.info(f"[紧急平仓] 完成: L={self.lighter_position} X={self.extended_position}")
+        self.logger.info(f"[紧急平仓] 完成: L={self.lighter_position} HS={self.hotstuff_position}")
 
     # ─────────────────────────────────────────────
     #  V23: Balance P&L verification
@@ -2536,91 +1830,38 @@ class SpreadArbBot:
     async def _v23_record_pre_trade_balance(self):
         """开仓完成后快照余额, 作为下次平仓的基准。"""
         try:
-            _l, _x = await self._snapshot_balances()
+            _l, _ = await self._snapshot_balances()
             if _l is not None:
                 self._pre_trade_balance_l = _l
-            if _x is not None:
-                self._pre_trade_balance_x = _x
-            if _l is not None and _x is not None:
-                self.logger.info(
-                    f"[V35] 开仓后余额快照: L={_l} X={_x} 合计={_l+_x}")
+                self.logger.info(f"[V36] 开仓后余额快照: L={_l}")
         except Exception as e:
-            self.logger.warning(f"[V35] 开仓余额快照失败: {e}")
+            self.logger.warning(f"[V36] 开仓余额快照失败: {e}")
 
     async def _v23_verify_close_pnl(self, formula_net_bps: float, formula_dollar: float,
-                                     close_qty: Decimal, x_price: Decimal) -> Tuple[str, str, str, str]:
-        """平仓后查余额, 计算真实P&L, 与公式P&L对比。
+                                     close_qty: Decimal, hs_price: Decimal) -> Tuple[str, str, str, str]:
+        """平仓后查Lighter余额, 计算真实P&L (HotStuff无余额API, 仅用Lighter侧)。
 
-        Returns: (real_pnl_str, cumulative_real_str, bal_l_str, bal_x_str)
+        Returns: (real_pnl_str, cumulative_real_str, bal_l_str, bal_hs_str)
         """
         try:
-            _l_after, _x_after = await self._snapshot_balances()
-            if _l_after is None or _x_after is None:
+            _l_after, _ = await self._snapshot_balances()
+            if _l_after is None:
                 return "", "", "", ""
 
             _bal_l_str = str(_l_after)
-            _bal_x_str = str(_x_after)
 
             _pre_l = self._pre_trade_balance_l
-            _pre_x = self._pre_trade_balance_x
-            if _pre_l is None or _pre_x is None:
-                self.logger.info(
-                    f"[V35] 平仓后余额: L={_l_after} X={_x_after} (无开仓基准, 跳过对比)")
+            if _pre_l is None:
+                self.logger.info(f"[V36] 平仓后余额: L={_l_after} (无开仓基准, 跳过对比)")
                 self._pre_trade_balance_l = _l_after
-                self._pre_trade_balance_x = _x_after
-                return "", f"{self.cumulative_real_pnl:.6f}", _bal_l_str, _bal_x_str
-
-            _real_pnl = float((_l_after + _x_after) - (_pre_l + _pre_x))
-            self.cumulative_real_pnl += _real_pnl
-
-            _real_bps = _real_pnl / (float(close_qty) * float(x_price)) * 10000 if close_qty > 0 and x_price > 0 else 0
-            _diff = _real_pnl - formula_dollar
-            _diff_bps = abs(_real_bps - formula_net_bps)
-
-            self.logger.info(
-                f"[V23 余额校验] "
-                f"公式P&L=${formula_dollar:+.6f}({formula_net_bps:+.2f}bps)  "
-                f"真实P&L=${_real_pnl:+.6f}({_real_bps:+.2f}bps)  "
-                f"偏差=${_diff:+.6f}({_diff_bps:.2f}bps)  "
-                f"累积真实=${self.cumulative_real_pnl:+.6f}")
-
-            if _diff_bps > 2.0:
-                self.logger.info(
-                    f"[V23] 单笔偏差={_diff_bps:.2f}bps (持仓期间未实现盈亏所致, 非异常)")
-
-            # 会话累积校验 — 用累积偏差判断是否有系统性问题
-            if self._initial_balance_l is not None and self._initial_balance_x is not None:
-                _total_now = _l_after + _x_after
-                _total_init = self._initial_balance_l + self._initial_balance_x
-                _session_real = float(_total_now - _total_init)
-                _session_formula = self.cumulative_dollar_pnl
-                _session_diff = abs(_session_real - _session_formula)
-                self.logger.info(
-                    f"[V23 会话] "
-                    f"公式累积=${_session_formula:+.6f}  "
-                    f"真实累积=${_session_real:+.6f}  "
-                    f"偏差=${_session_diff:.6f}")
-                _pnl_threshold = float(self.order_size) * 72000 * 0.0015
-                if _session_diff > _pnl_threshold:
-                    self._consecutive_pnl_deviations += 1
-                    self.logger.warning(
-                        f"[V23 !!] 会话累积偏差过大=${_session_diff:.4f} "
-                        f"(>${_pnl_threshold:.2f}阈值) 连续{self._consecutive_pnl_deviations}次")
-                    if self._consecutive_pnl_deviations >= 5:
-                        self._circuit_breaker_until = time.time() + 300
-                        self.logger.error(
-                            f"[V23 熔断] 会话累积偏差连续{self._consecutive_pnl_deviations}次"
-                            f">${_pnl_threshold:.2f}! 熔断300秒")
-                        self._consecutive_pnl_deviations = 0
-                else:
-                    self._consecutive_pnl_deviations = 0
+                return "", f"{self.cumulative_real_pnl:.6f}", _bal_l_str, ""
 
             self._pre_trade_balance_l = _l_after
-            self._pre_trade_balance_x = _x_after
-            return f"{_real_pnl:+.6f}", f"{self.cumulative_real_pnl:.6f}", _bal_l_str, _bal_x_str
+            self.logger.info(f"[V36] 平仓后余额: L={_l_after}")
+            return "", f"{self.cumulative_real_pnl:.6f}", _bal_l_str, ""
 
         except Exception as e:
-            self.logger.warning(f"[V35] 余额校验异常: {e}")
+            self.logger.warning(f"[V36] 余额校验异常: {e}")
             return "", "", "", ""
 
     # ─────────────────────────────────────────────
@@ -2677,11 +1918,23 @@ class SpreadArbBot:
         except Exception:
             pass
 
-        if (abs(self.lighter_position) >= self.extended_min_order_size
-                or abs(self.extended_position) >= self.extended_min_order_size):
+        try:
+            await self._cancel_all_hotstuff_orders()
+            self.logger.info("[退出] HotStuff挂单已撤销")
+        except Exception as e:
+            self.logger.error(f"[退出] 撤HotStuff单异常: {e}")
+
+        if self.hs_feed:
+            try:
+                await self.hs_feed.disconnect()
+            except Exception:
+                pass
+
+        if (abs(self.lighter_position) >= self.hs_lot_size
+                or abs(self.hotstuff_position) >= self.hs_lot_size):
             self.logger.info(
                 f"[退出] 残余仓位: L={self.lighter_position} "
-                f"X={self.extended_position}, 紧急平仓")
+                f"HS={self.hotstuff_position}, 紧急平仓")
             try:
                 await self._emergency_flatten()
             except Exception as e:
@@ -2694,103 +1947,113 @@ class SpreadArbBot:
     # ─────────────────────────────────────────────
 
     async def _main_loop(self):
-        fee_one = float(FEE_EXTENDED_TAKER) * 10000
+        fee_one = float(FEE_HOTSTUFF_TAKER) * 10000
         _ladder_str = f"阶梯={self.ladder_step_bps}bps" if self.ladder_step_bps > 0 else "阶梯=关闭"
         self.logger.info(
-            f"启动 V35.1 解耦开仓  {self.symbol}  "
+            f"启动 HotStuff+Lighter V36 双Taker套利  {self.symbol}  "
             f"size={self.order_size}  "
-            f"开仓JIT: spread≥{self.open_spread_bps}bps(+{self.spread_buffer_bps}bps) "
-            f"→ {self.open_jit_price_mode}挂单{self.open_jit_wait}秒  "
-            f"V35.1阈值: fee({fee_one:.2f})+exp_close({self.expected_close_cost})"
+            f"开仓: HotStuff IOC + Lighter IOC 对冲  L1 深度检查  "
+            f"阈值: fee({fee_one:.2f})+ec({self.expected_close_cost})"
             f"+lat_cap({self.latency_cap})+edge({self.edge_buffer})  "
-            f"平仓<{self.close_spread_bps}bps  {_ladder_str}  "
+            f"平仓: basis<{self.close_spread_bps}bps → 深度检查+Taker IOC  {_ladder_str}  "
             f"max_pos={self.max_position}  dry_run={self.dry_run}")
 
         if not self.dry_run:
             self._init_lighter()
             self._get_lighter_market_config()
-            self._init_extended()
-            await self.extended_client.connect()
-            self.extended_client.setup_order_update_handler(self._on_extended_order_update)
-
-            # 预热 Extended SDK 市场缓存 + HTTP 连接池
-            _t0 = time.time()
-            try:
-                _markets = await self.extended_client.perpetual_trading_client.markets_info.get_markets()
-                if _markets and _markets.data:
-                    self.extended_client.perpetual_trading_client._PerpetualTradingClient__markets = {
-                        m.name: m for m in _markets.data}
-                _warmup_ms = (time.time() - _t0) * 1000
-                self.logger.info(f"交易客户端就绪 (Extended预热={_warmup_ms:.0f}ms)")
-            except Exception as e:
-                self.logger.warning(f"Extended预热失败: {e}")
-                self.logger.info("交易客户端就绪")
+            self._init_hotstuff()
+            self._get_hotstuff_instrument_info()
 
             await self._cancel_all_lighter()
+            await self._cancel_all_hotstuff_orders()
+            self.logger.info("交易客户端就绪")
         else:
             self._get_lighter_market_config()
 
         self._lighter_ws_task = asyncio.create_task(self._lighter_ws_loop())
 
+        self.hs_feed = HotstuffFeed(self.symbol)
+        self._hs_feed_task = asyncio.create_task(self.hs_feed.connect())
+
         self.logger.info("等待行情就绪...")
         t0 = time.time()
         while time.time() - t0 < 20 and not self.stop_flag:
-            ext_bid, ext_ask = self._get_ext_bbo()
-            ext_ok = ext_bid is not None and ext_ask is not None
+            hs_bid, hs_ask = self._get_hs_bbo()
+            hs_ok = hs_bid is not None and hs_ask is not None
             l_ok = self._l_best_bid is not None and self._l_best_ask is not None
-            if ext_ok and l_ok:
+            if hs_ok and l_ok:
                 break
             if time.time() - t0 > 5 and int(time.time() - t0) % 3 == 0:
                 self.logger.info(
-                    f"  等待中... X={'OK' if ext_ok else 'WAIT'} "
+                    f"  等待中... HS={'OK' if hs_ok else 'WAIT'} "
                     f"L={'OK' if l_ok else 'WAIT'}")
             await asyncio.sleep(0.5)
 
-        ext_bid, ext_ask = self._get_ext_bbo()
-        if ext_bid is None or self._l_best_bid is None:
+        hs_bid, hs_ask = self._get_hs_bbo()
+        if hs_bid is None or self._l_best_bid is None:
             self.logger.error(
-                f"行情超时! X={ext_bid}/{ext_ask} "
+                f"行情超时! HS={hs_bid}/{hs_ask} "
                 f"L={self._l_best_bid}/{self._l_best_ask}")
             return
 
         self.logger.info(
             f"行情就绪: L={self._l_best_bid}/{self._l_best_ask}  "
-            f"X={ext_bid}/{ext_ask}")
+            f"HS={hs_bid}/{hs_ask}")
 
         if not self.dry_run:
+            # ── 启动仓位同步: 二次确认防止API陈旧数据 ──
             await self._reconcile()
-            _has_residual = (abs(self.lighter_position) >= self.extended_min_order_size
-                             or abs(self.extended_position) >= self.extended_min_order_size)
+            _has_residual = (abs(self.lighter_position) >= self.hs_lot_size
+                             or abs(self.hotstuff_position) >= self.hs_lot_size)
             if _has_residual:
-                _net = abs(self.lighter_position + self.extended_position)
+                _l1, _h1 = self.lighter_position, self.hotstuff_position
+                self.logger.info(
+                    f"[启动] 首次查询检测到仓位: L={_l1} HS={_h1}, "
+                    f"等待3s二次确认...")
+                await asyncio.sleep(3)
+                await self._reconcile()
+                _l2, _h2 = self.lighter_position, self.hotstuff_position
+                if _l1 != _l2 or _h1 != _h2:
+                    self.logger.warning(
+                        f"[启动] 二次查询仓位有变化: "
+                        f"L {_l1}→{_l2}  HS {_h1}→{_h2}")
+                _has_residual = (abs(self.lighter_position) >= self.hs_lot_size
+                                 or abs(self.hotstuff_position) >= self.hs_lot_size)
+
+            if _has_residual:
+                _net = abs(self.lighter_position + self.hotstuff_position)
                 if getattr(self, 'flatten_on_start', False):
                     self.logger.warning(
-                        f"[启动] 残余仓位: L={self.lighter_position} X={self.extended_position}  "
+                        f"[启动] 残余仓位: L={self.lighter_position} HS={self.hotstuff_position}  "
                         f"--flatten-on-start → 紧急平仓")
                     await self._emergency_flatten()
                 elif _net > self.order_size * Decimal("0.5"):
                     self.logger.warning(
-                        f"[启动] 仓位不平衡: L={self.lighter_position} X={self.extended_position} "
+                        f"[启动] 仓位不平衡: L={self.lighter_position} HS={self.hotstuff_position} "
                         f"净敞口={_net} → 紧急平仓修复")
                     await self._emergency_flatten()
                 else:
+                    _synced_layers = int(
+                        min(abs(self.lighter_position), abs(self.hotstuff_position))
+                        / self.order_size)
+                    if self.ladder_step_bps > 0 and _synced_layers > 0:
+                        self._ladder_level = _synced_layers
                     self.logger.info(
-                        f"[启动] 平衡仓位: L={self.lighter_position} X={self.extended_position} "
-                        f"净={_net}, 继续交易(阶梯从L0计算)")
+                        f"[启动] 同步交易所仓位: L={self.lighter_position} "
+                        f"HS={self.hotstuff_position}  净={_net}  "
+                        f"恢复阶梯=L{self._ladder_level} "
+                        f"(下次开仓阈值≥{self.open_spread_bps + self._ladder_level * self.ladder_step_bps:.1f}bps)")
 
-            # V23: 记录初始余额基准
-            _l_bal, _x_bal = await self._snapshot_balances()
+            # 记录初始余额基准
+            _l_bal, _ = await self._snapshot_balances()
             self._initial_balance_l = _l_bal
-            self._initial_balance_x = _x_bal
+            self._initial_balance_x = None
             self._pre_trade_balance_l = _l_bal
-            self._pre_trade_balance_x = _x_bal
-            if _l_bal is not None and _x_bal is not None:
-                self.logger.info(
-                    f"[V35] 初始余额: Lighter={_l_bal}  Extended={_x_bal}  "
-                    f"合计={_l_bal + _x_bal}")
+            self._pre_trade_balance_x = None
+            if _l_bal is not None:
+                self.logger.info(f"[V36] 初始余额: Lighter={_l_bal}")
             else:
-                self.logger.warning(
-                    f"[V35] 初始余额部分获取失败: L={_l_bal} X={_x_bal}")
+                self.logger.warning(f"[V36] 初始余额获取失败")
 
         self.logger.info(f"进入主循环  状态={self.state.value}")
         last_status_log = 0.0
@@ -2799,31 +2062,31 @@ class SpreadArbBot:
         while not self.stop_flag:
             try:
                 now = time.time()
-                ext_bid, ext_ask = self._get_ext_bbo()
+                hs_bid, hs_ask = self._get_hs_bbo()
                 l_bid = self._l_best_bid
                 l_ask = self._l_best_ask
 
-                if ext_bid is None or ext_ask is None or l_bid is None or l_ask is None:
+                if hs_bid is None or hs_ask is None or l_bid is None or l_ask is None:
                     await asyncio.sleep(self.interval)
                     continue
 
-                x_age = now - self.extended_client._ob_last_update_ts if self.extended_client else 999
+                hs_age = now - self._hs_bbo_ts if self._hs_bbo_ts > 0 else 999
                 l_age = now - self._l_ws_ts if self._l_ws_ts > 0 else 999
-                if l_age > 5 or x_age > 5:
+                if l_age > 5 or hs_age > 5:
                     await asyncio.sleep(self.interval)
                     continue
 
-                mid = (l_bid + l_ask + ext_bid + ext_ask) / 4
-                basis_bps = float((l_bid + l_ask - ext_bid - ext_ask) / 2 / mid * 10000)
+                mid = (l_bid + l_ask + hs_bid + hs_ask) / 4
+                basis_bps = float((l_bid + l_ask - hs_bid - hs_ask) / 2 / mid * 10000)
 
                 # ── V34: Update EWMA volatility ──
                 self._update_vol_tracker(l_bid, l_ask)
 
                 # ── V34.1: Shadow learning (passive latency decay) ──
-                _s_sell_raw = float((l_bid - ext_ask) / ext_ask * 10000) if ext_ask > 0 else 0
-                _s_buy_raw = float((ext_bid - l_ask) / l_ask * 10000) if l_ask > 0 else 0
+                _s_sell_raw = float((l_bid - hs_ask) / hs_ask * 10000) if hs_ask > 0 else 0
+                _s_buy_raw = float((hs_bid - l_ask) / l_ask * 10000) if l_ask > 0 else 0
                 self._shadow_snapshot(now, _s_sell_raw, _s_buy_raw)
-                self._process_shadow_learning(now, l_bid, l_ask, ext_bid, ext_ask)
+                self._process_shadow_learning(now, l_bid, l_ask, hs_bid, hs_ask)
 
                 # ── Status log (V35: show bucketed latency) ──
                 if now - last_status_log > 15:
@@ -2831,20 +2094,20 @@ class SpreadArbBot:
                     _st_v_bkt = self._bucket_vol(self._short_vol_bps)
                     self.logger.info(
                         f"[{self.state.value}] basis={basis_bps:+.1f}bps  "
-                        f"L={l_bid}/{l_ask} X={ext_bid}/{ext_ask}  "
-                        f"L_pos={self.lighter_position} X_pos={self.extended_position}  "
-                        f"鲜度:L={l_age:.1f}s X={x_age:.1f}s  "
+                        f"L={l_bid}/{l_ask} HS={hs_bid}/{hs_ask}  "
+                        f"L_pos={self.lighter_position} HS_pos={self.hotstuff_position}  "
+                        f"鲜度:L={l_age:.1f}s HS={hs_age:.1f}s  "
                         f"vol={self._short_vol_bps:.1f}bps({_st_v_bkt})  "
                         f"lat_b={self.latency_pool.summary('buy', _st_s_bkt, _st_v_bkt)}"
                         f"/s={self.latency_pool.summary('sell', _st_s_bkt, _st_v_bkt)}bps  "
-                        f"累积=${self.cumulative_dollar_pnl:+.4f}")
+                        f"累積=${self.cumulative_dollar_pnl:+.4f}")
                     last_status_log = now
 
                 # ── Periodic reconcile + 仓位修复 (统一Lighter IOC, 0费用) ──
                 if not self.dry_run and now - last_reconcile > 60 and self.state == State.IDLE:
                     await self._reconcile()
                     last_reconcile = now
-                    _net = self.lighter_position + self.extended_position
+                    _net = self.lighter_position + self.hotstuff_position
                     _imbalance = abs(_net)
 
                     if _imbalance >= self.lighter_min_size_step:
@@ -2857,7 +2120,7 @@ class SpreadArbBot:
                         if _safe:
                             self.logger.warning(
                                 f"[对账] 偏差={_imbalance}, "
-                                f"L={self.lighter_position} X={self.extended_position} "
+                                f"L={self.lighter_position} X={self.hotstuff_position} "
                                 f"net={_net} → Lighter IOC {_repair_side} {_repair_qty}")
                             self._in_flatten = True
                             if _repair_side == "buy":
@@ -2880,7 +2143,7 @@ class SpreadArbBot:
                         f"→ 立即触发对账修复")
                     await self._reconcile()
                     last_reconcile = now
-                    _net = self.lighter_position + self.extended_position
+                    _net = self.lighter_position + self.hotstuff_position
                     _imbalance = abs(_net)
                     if _imbalance >= self.lighter_min_size_step:
                         _sf_repair_qty = min(_imbalance, self.order_size)
@@ -2915,10 +2178,10 @@ class SpreadArbBot:
                         await asyncio.sleep(self.interval)
                         continue
 
-                    _has_pos = (abs(self.lighter_position) >= self.extended_min_order_size
-                                and abs(self.extended_position) >= self.extended_min_order_size)
+                    _has_pos = (abs(self.lighter_position) >= self.hs_lot_size
+                                and abs(self.hotstuff_position) >= self.hs_lot_size)
 
-                    # ── V34 分级平仓: 根据残余edge选择对冲模式 ──
+                    # ── V36: 深度检查 + Taker IOC 平仓 ──
                     if _has_pos:
                         if self.lighter_position < 0:
                             _should_close = basis_bps <= self.close_spread_bps
@@ -2926,7 +2189,7 @@ class SpreadArbBot:
                             _should_close = basis_bps >= -self.close_spread_bps
                         if _should_close:
                             _closable = min(abs(self.lighter_position),
-                                            abs(self.extended_position))
+                                            abs(self.hotstuff_position))
                             _batch_qty = min(_closable, self.order_size)
 
                             # V35.2: depth check before closing
@@ -2942,58 +2205,45 @@ class SpreadArbBot:
                                 await asyncio.sleep(self.interval)
                                 continue
 
-                            _hedge_mode = self._choose_hedge_mode(
-                                basis_bps, l_bid, l_ask, ext_bid, ext_ask, _batch_qty)
-                            self._signal_hedge_mode = _hedge_mode.value
+                            self._signal_hedge_mode = "taker"
 
                             _total_layers = max(1, int(_closable / self.order_size))
                             self.logger.info(
                                 f"[IDLE] 价差收敛! basis={basis_bps:.1f}bps  "
-                                f"mode={_hedge_mode.value}  "
+                                f"mode=taker  "
                                 f"单层平1/{_total_layers}层 qty={_batch_qty}  "
                                 f"depth={_depth_avail:.5f} slip={_depth_slip:.1f}bps  "
-                                f"L={self.lighter_position} X={self.extended_position}  "
+                                f"L={self.lighter_position} X={self.hotstuff_position}  "
                                 f"ladder=L{self._ladder_level}")
 
-                            # V34: dispatch to actual execution path per mode
-                            if _hedge_mode == HedgeMode.PASSIVE:
-                                ok, _closed = await self._close_position_passive(
-                                    l_bid, l_ask, ext_bid, ext_ask, _batch_qty)
-                            elif _hedge_mode == HedgeMode.AGGRESSIVE:
-                                ok, _closed = await self._close_position_aggressive(
-                                    l_bid, l_ask, ext_bid, ext_ask, _batch_qty)
-                            elif _hedge_mode == HedgeMode.FAST:
-                                ok, _closed = await self._close_position_batch(
-                                    l_bid, l_ask, ext_bid, ext_ask, _batch_qty)
-                            else:
-                                ok, _closed = await self._close_position_emergency(
-                                    l_bid, l_ask, ext_bid, ext_ask, _batch_qty)
+                            ok, _closed = await self._close_position_taker(
+                                l_bid, l_ask, hs_bid, hs_ask, _batch_qty)
 
                             if not ok:
-                                self.logger.error("[IDLE] 批量平仓失败 → REPAIR")
+                                self.logger.error("[IDLE] 平仓失败 → REPAIR")
                                 self.state = State.REPAIR
                                 continue
 
-                            ext_bid, ext_ask = self._get_ext_bbo()
+                            hs_bid, hs_ask = self._get_hs_bbo()
                             l_bid = self._l_best_bid
                             l_ask = self._l_best_ask
 
-                            _still_has = (abs(self.lighter_position) >= self.extended_min_order_size
-                                          and abs(self.extended_position) >= self.extended_min_order_size)
+                            _still_has = (abs(self.lighter_position) >= self.hs_lot_size
+                                          and abs(self.hotstuff_position) >= self.hs_lot_size)
                             if _still_has and self.close_wait_sec > 0:
                                 self.logger.info(
                                     f"[IDLE] 已平{_closed}层, 等待{self.close_wait_sec}s观察价差是否继续收敛"
                                     f" (深度阈值={self.close_deep_bps}bps)")
                                 await asyncio.sleep(self.close_wait_sec)
 
-                                ext_bid, ext_ask = self._get_ext_bbo()
+                                hs_bid, hs_ask = self._get_hs_bbo()
                                 l_bid = self._l_best_bid
                                 l_ask = self._l_best_ask
-                                if (ext_bid is None or ext_ask is None
+                                if (hs_bid is None or hs_ask is None
                                         or l_bid is None or l_ask is None):
                                     continue
-                                mid = (l_bid + l_ask + ext_bid + ext_ask) / 4
-                                _new_basis = float((l_bid + l_ask - ext_bid - ext_ask) / 2 / mid * 10000)
+                                mid = (l_bid + l_ask + hs_bid + hs_ask) / 4
+                                _new_basis = float((l_bid + l_ask - hs_bid - hs_ask) / 2 / mid * 10000)
 
                                 if self.lighter_position < 0:
                                     _deep_ok = _new_basis <= self.close_deep_bps
@@ -3002,7 +2252,7 @@ class SpreadArbBot:
                                 if _deep_ok:
                                     _remain_qty = min(
                                         abs(self.lighter_position),
-                                        abs(self.extended_position),
+                                        abs(self.hotstuff_position),
                                         self.order_size,
                                     )
 
@@ -3017,28 +2267,15 @@ class SpreadArbBot:
                                             f"可用={_d2_avail:.5f} → 跳过")
                                         continue
 
-                                    _deep_mode = self._choose_hedge_mode(
-                                        _new_basis, l_bid, l_ask, ext_bid, ext_ask,
-                                        _remain_qty)
-                                    self._signal_hedge_mode = _deep_mode.value
+                                    self._signal_hedge_mode = "taker"
                                     self.logger.info(
                                         f"[IDLE] 价差继续收敛! basis={_new_basis:.1f}bps "
                                         f"≤ {self.close_deep_bps}bps → "
-                                        f"mode={_deep_mode.value} 单层平剩余 {_remain_qty} "
+                                        f"mode=taker 单层平剩余 {_remain_qty} "
                                         f"depth={_d2_avail:.5f} slip={_d2_slip:.1f}bps")
-                                    if _remain_qty >= self.extended_min_order_size:
-                                        if _deep_mode == HedgeMode.PASSIVE:
-                                            ok, _ = await self._close_position_passive(
-                                                l_bid, l_ask, ext_bid, ext_ask, _remain_qty)
-                                        elif _deep_mode == HedgeMode.AGGRESSIVE:
-                                            ok, _ = await self._close_position_aggressive(
-                                                l_bid, l_ask, ext_bid, ext_ask, _remain_qty)
-                                        elif _deep_mode == HedgeMode.FAST:
-                                            ok, _ = await self._close_position_batch(
-                                                l_bid, l_ask, ext_bid, ext_ask, _remain_qty)
-                                        else:
-                                            ok, _ = await self._close_position_emergency(
-                                                l_bid, l_ask, ext_bid, ext_ask, _remain_qty)
+                                    if _remain_qty >= self.hs_lot_size:
+                                        ok, _ = await self._close_position_taker(
+                                            l_bid, l_ask, hs_bid, hs_ask, _remain_qty)
                                         if not ok:
                                             self.state = State.REPAIR
                                 else:
@@ -3049,67 +2286,65 @@ class SpreadArbBot:
 
                     # ── 持仓上限检查 ──
                     _abs_l = abs(self.lighter_position)
-                    _abs_x = abs(self.extended_position)
+                    _abs_x = abs(self.hotstuff_position)
                     _at_max = (_abs_l >= self.max_position
                                or _abs_x >= self.max_position)
                     if _at_max:
                         if now - last_status_log > 15:
                             self.logger.info(
                                 f"[IDLE] 持仓已满 "
-                                f"L={self.lighter_position} X={self.extended_position} "
+                                f"L={self.lighter_position} X={self.hotstuff_position} "
                                 f"max={self.max_position}, 等待价差收敛平仓")
                         await asyncio.sleep(1)
                         continue
 
-                    # ━━━━━━ V34 JIT开仓: VWAP spread + 动态阈值 + 持续性过滤 ━━━━━━
+                    # ━━━━━━ V36 双向自动开仓: HotStuff IOC + Lighter IOC 对冲 ━━━━━━
+                    # Direction A: HS buy + L sell → profitable when L_bid > HS_ask
+                    # Direction B: HS sell + L buy → profitable when HS_bid > L_ask
                     _allow_sell = self.lighter_position >= -self.max_position * Decimal("0.8")
                     _allow_buy = self.lighter_position <= self.max_position * Decimal("0.8")
 
-                    # V34: Use VWAP-adjusted spread (size-aware)
-                    _sell_spread_raw = float((l_bid - ext_ask) / ext_ask * 10000) if ext_ask > 0 else 0
-                    _buy_spread_raw = float((ext_bid - l_ask) / l_ask * 10000) if l_ask > 0 else 0
+                    _sell_spread_raw = float((l_bid - hs_ask) / hs_ask * 10000) if hs_ask > 0 else 0
+                    _buy_spread_raw = float((hs_bid - l_ask) / l_ask * 10000) if l_ask > 0 else 0
 
                     _l_vwap_bid = self._calc_lighter_vwap("sell", self.order_size)
                     _l_vwap_ask = self._calc_lighter_vwap("buy", self.order_size)
-                    _sell_spread_exec = float((_l_vwap_bid - ext_ask) / ext_ask * 10000) \
-                        if _l_vwap_bid and ext_ask > 0 else _sell_spread_raw
-                    _buy_spread_exec = float((ext_bid - _l_vwap_ask) / _l_vwap_ask * 10000) \
-                        if _l_vwap_ask and ext_bid > 0 else _buy_spread_raw
+                    _sell_spread_exec = float((_l_vwap_bid - hs_ask) / hs_ask * 10000) \
+                        if _l_vwap_bid and hs_ask > 0 else _sell_spread_raw
+                    _buy_spread_exec = float((hs_bid - _l_vwap_ask) / _l_vwap_ask * 10000) \
+                        if _l_vwap_ask and hs_bid > 0 else _buy_spread_raw
 
-                    # V35: Dynamic threshold with bucketed latency
                     _sell_threshold = self._calc_dynamic_threshold(
                         "sell", self.order_size, _sell_spread_raw)
                     _buy_threshold = self._calc_dynamic_threshold(
                         "buy", self.order_size, _buy_spread_raw)
 
-                    # Determine which side has edge (pick higher excess margin)
-                    _jit_side = None
-                    _jit_price = None
-                    _jit_spread = 0.0
-                    _jit_threshold = 0.0
-                    _jit_spread_raw = 0.0
+                    _open_side = None
+                    _open_spread = 0.0
+                    _open_threshold = 0.0
+                    _open_spread_raw = 0.0
 
                     _sell_excess = (_sell_spread_exec - _sell_threshold) if _allow_sell else -1e9
                     _buy_excess = (_buy_spread_exec - _buy_threshold) if _allow_buy else -1e9
 
                     if _sell_excess > 0 or _buy_excess > 0:
                         if _sell_excess >= _buy_excess:
-                            _jit_side = "sell"
-                            _jit_spread = _sell_spread_exec
-                            _jit_spread_raw = _sell_spread_raw
-                            _jit_threshold = _sell_threshold
+                            _open_side = "sell"
+                            _open_spread = _sell_spread_exec
+                            _open_spread_raw = _sell_spread_raw
+                            _open_threshold = _sell_threshold
                         else:
-                            _jit_side = "buy"
-                            _jit_spread = _buy_spread_exec
-                            _jit_spread_raw = _buy_spread_raw
-                            _jit_threshold = _buy_threshold
+                            _open_side = "buy"
+                            _open_spread = _buy_spread_exec
+                            _open_spread_raw = _buy_spread_raw
+                            _open_threshold = _buy_threshold
 
                     # V34: Persistence filter with direction memory
-                    if _jit_side:
-                        if _jit_side != self._persist_side:
+                    if _open_side:
+                        if _open_side != self._persist_side:
                             self._spread_above_count = 1
                             self._spread_above_since = now
-                            self._persist_side = _jit_side
+                            self._persist_side = _open_side
                         else:
                             self._spread_above_count += 1
                             if self._spread_above_since is None:
@@ -3125,238 +2360,265 @@ class SpreadArbBot:
                             and now - self._spread_above_since >= self.persist_ms)
                     )
 
-                    if _jit_side and _persistent:
-                        _jit_price = self._compute_jit_price(
-                            _jit_side, l_bid, l_ask, self.open_jit_price_mode)
+                    if _open_side and _persistent:
+                        # V36: Check L1+L2 depth before taker
+                        _depth_ok, _depth_avail, _depth_slip, _depth_vwap = \
+                            self._check_lighter_open_depth(
+                                _open_side, self.order_size, self.open_depth_levels)
 
-                    if _jit_side and _jit_price and _jit_price > 0 and _persistent:
+                        if not _depth_ok:
+                            self.logger.info(
+                                f"[TAKER] {_open_side} 深度不足: "
+                                f"需要{float(self.order_size):.4f} "
+                                f"可用={_depth_avail:.5f} "
+                                f"(L1-L{self.open_depth_levels}) → 跳过")
+                            await asyncio.sleep(self.interval)
+                            continue
+
+                        # Compute IOC price with slip buffer
+                        _slip_buf = Decimal("0.003")
+                        if _open_side == "buy":
+                            _ioc_price = self._round_lighter(
+                                l_ask * (Decimal("1") + _slip_buf))
+                        else:
+                            _ioc_price = self._round_lighter(
+                                l_bid * (Decimal("1") - _slip_buf))
+
                         # Snapshot signal quality for CSV logging
-                        _sig_s_bkt = self._bucket_spread(_jit_spread_raw)
+                        _sig_s_bkt = self._bucket_spread(_open_spread_raw)
                         _sig_v_bkt = self._bucket_vol(self._short_vol_bps)
                         _sig_lat, _sig_lat_lvl = self.latency_pool.get_latency(
-                            _jit_side, _sig_s_bkt, _sig_v_bkt)
+                            _open_side, _sig_s_bkt, _sig_v_bkt)
 
-                        self._signal_observed_spread = _jit_spread_raw
-                        self._signal_executable_spread = _jit_spread
+                        self._signal_observed_spread = _open_spread_raw
+                        self._signal_executable_spread = _open_spread
                         self._signal_latency_penalty = _sig_lat
                         self._signal_vol_bps = self._short_vol_bps
-                        self._signal_effective_bps = _jit_threshold
+                        self._signal_effective_bps = _open_threshold
                         self._signal_s_bucket = _sig_s_bkt
                         self._signal_v_bucket = _sig_v_bkt
-                        self._signal_d_bucket = self._bucket_depth(_jit_side, self.order_size)
+                        self._signal_d_bucket = self._bucket_depth(_open_side, self.order_size)
                         self._signal_t_bucket = self._bucket_session(datetime.now(_TZ_CN).hour)
 
+                        # L1 深度检查: HotStuff
+                        _hs_depth_side = "buy" if _open_side == "sell" else "sell"
+                        if _hs_depth_side == "buy":
+                            _hs_l1_sz = self._hs_l1_ask_size
+                        else:
+                            _hs_l1_sz = self._hs_l1_bid_size
+                        if _hs_l1_sz < float(self.order_size):
+                            self.logger.info(
+                                f"[TAKER] HotStuff L1深度不足: "
+                                f"需要{float(self.order_size):.4f} "
+                                f"可用={_hs_l1_sz:.5f} → 跳过")
+                            await asyncio.sleep(self.interval)
+                            continue
+
                         self.logger.info(
-                            f"[JIT] {_jit_side} exec={_jit_spread:.1f}bps(raw={_jit_spread_raw:.1f}) "
-                            f"≥ thresh={_jit_threshold:.1f}bps"
-                            f"(fee=2.25+ec={self.expected_close_cost}"
+                            f"[TAKER] {_open_side} exec={_open_spread:.1f}bps"
+                            f"(raw={_open_spread_raw:.1f}) "
+                            f"≥ thresh={_open_threshold:.1f}bps"
+                            f"(fee=2.5+ec={self.expected_close_cost}"
                             f"+lat={min(_sig_lat, self.latency_cap):.1f}[L{_sig_lat_lvl}]"
                             f"+vol={self._short_vol_bps * self.vol_weight:.1f}"
                             f"+edge={self.edge_buffer})  "
                             f"persist={self._spread_above_count}  "
-                            f"挂@{_jit_price} ({self.open_jit_price_mode}) → 等{self.open_jit_wait}秒")
+                            f"L_depth={_depth_avail:.5f} HS_depth={_hs_l1_sz:.5f}  "
+                            f"slip={_depth_slip:.1f}bps")
+
+                        # V36 HotStuff+Lighter: HotStuff IOC 开仓 (乐观填充)
+                        #   direction sell: HS_bid > L_ask → HS sell + L buy
+                        #   direction buy:  L_bid > HS_ask → HS buy + L sell
+                        _hs_open_side = "buy" if _open_side == "sell" else "sell"
+                        _hs_ref = hs_ask if _hs_open_side == "buy" else hs_bid
+
+                        _t0_open = time.time()
+                        _hs_fill = await self._hedge_hotstuff(
+                            _hs_open_side, self.order_size, _hs_ref)
+                        _open_ms = (time.time() - _t0_open) * 1000
+
+                        if _hs_fill is None:
+                            self.logger.error(
+                                f"[TAKER] HotStuff IOC失败 ({_open_ms:.0f}ms)")
+                            self._reset_cycle()
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        self.logger.info(
+                            f"[TAKER] HotStuff IOC完成 ({_open_ms:.0f}ms) "
+                            f"{_hs_open_side} {self.order_size} → 即时Lighter对冲")
+
+                        # 即时 Lighter IOC 对冲
+                        _l_hedge_side = _open_side  # sell on L when HS buys, buy on L when HS sells
+                        _l_ref = l_bid if _l_hedge_side == "sell" else l_ask
+
+                        _slip_buf = Decimal("0.003")
+                        if _l_hedge_side == "buy":
+                            _l_ioc_price = self._round_lighter(
+                                l_ask * (Decimal("1") + _slip_buf))
+                        else:
+                            _l_ioc_price = self._round_lighter(
+                                l_bid * (Decimal("1") - _slip_buf))
+
+                        _ioc_cid = int(time.time() * 1000) * 10 + (
+                            1 if _l_hedge_side == "sell" else 2)
 
                         self._fill_event.clear()
                         self._fill_side = None
-                        cid = await self._place_lighter_order(
-                            _jit_side, self.order_size, _jit_price)
+                        if _l_hedge_side == "sell":
+                            self._l_sell_client_id = _ioc_cid
+                        else:
+                            self._l_buy_client_id = _ioc_cid
 
-                        if cid:
-                            if _jit_side == "sell":
-                                self._l_sell_client_id = cid
-                            else:
-                                self._l_buy_client_id = cid
-
-                            _filled = False
-                            try:
-                                await asyncio.wait_for(
-                                    self._fill_event.wait(), timeout=self.open_jit_wait)
-                                _filled = self._fill_event.is_set()
-                            except asyncio.TimeoutError:
-                                pass
-
-                            if _filled:
-                                self.logger.info(
-                                    f"[JIT] 成交! → HEDGING")
+                        await self._lighter_rate_wait()
+                        try:
+                            _, _, _err = await self.lighter_client.create_order(
+                                market_index=self.lighter_market_index,
+                                client_order_index=_ioc_cid,
+                                base_amount=int(
+                                    self.order_size * self.base_amount_multiplier),
+                                price=int(_l_ioc_price * self.price_multiplier),
+                                is_ask=(_l_hedge_side == "sell"),
+                                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,
+                                reduce_only=False,
+                                trigger_price=0,
+                            )
+                            if _err:
+                                self.logger.error(
+                                    f"[TAKER] Lighter对冲IOC失败: {_err}")
                                 self.state = State.HEDGING
                                 continue
-                            else:
-                                await self._cancel_all_lighter()
-                                await asyncio.sleep(0.05)
-                                if self._fill_event.is_set():
-                                    self.logger.info("[JIT] 撤单时成交 → HEDGING")
-                                    self.state = State.HEDGING
-                                    continue
-                                _pos_snap = self.lighter_position
-                                try:
-                                    _rest_pos = await self._get_lighter_position()
-                                    _delta = abs(_rest_pos - _pos_snap)
-                                    if _delta >= self.order_size * Decimal("0.5"):
-                                        self.lighter_position = _rest_pos
-                                        self._fill_side = "buy" if _rest_pos > _pos_snap else "sell"
-                                        self._fill_qty = _delta
-                                        self._fill_price = l_ask if self._fill_side == "buy" else l_bid
-                                        self._fill_ext_bid, self._fill_ext_ask = self._get_ext_bbo()
-                                        self._fill_ts = time.time()
-                                        # BUG-3 fix: REST 路径也启动即时对冲，避免 HEDGING 白等 3 秒
-                                        self._instant_hedge_done.clear()
-                                        self._instant_hedge_ok = False
-                                        self._instant_hedge_fill_price = None
-                                        self._instant_hedge_task = asyncio.create_task(
-                                            self._instant_hedge_fire())
-                                        self._fill_event.set()
-                                        self.logger.warning(
-                                            f"[JIT] WS丢失fill! REST检测仓位变动: "
-                                            f"{_pos_snap}→{_rest_pos} → HEDGING (即时对冲已触发)")
-                                        self.state = State.HEDGING
-                                        continue
-                                except Exception as _e:
-                                    self.logger.warning(f"[JIT] REST校验异常: {_e}")
-                                self._reset_cycle()
-                                self.logger.info(f"[JIT] {self.open_jit_wait}秒未成交, 撤单")
+                        except Exception as _e:
+                            self.logger.error(
+                                f"[TAKER] Lighter对冲IOC异常: {_e}")
+                            self.state = State.HEDGING
+                            continue
+
+                        # Lighter乐观更新仓位
+                        if _l_hedge_side == "sell":
+                            self.lighter_position -= self.order_size
                         else:
-                            await asyncio.sleep(0.5)
-                    else:
-                        await asyncio.sleep(self.interval)
+                            self.lighter_position += self.order_size
 
-                # ━━━━━━ STATE: HEDGING ━━━━━━
-                elif self.state == State.HEDGING:
-                    _side = self._fill_side
-                    _qty = self._fill_qty
-                    _l_price = self._fill_price
-                    _hedge_side = "sell" if _side == "buy" else "buy"
+                        # 等待 WS 确认 (IOC 应在 <1s 内成交)
+                        _filled = False
+                        try:
+                            await asyncio.wait_for(
+                                self._fill_event.wait(), timeout=2.0)
+                            _filled = self._fill_event.is_set()
+                        except asyncio.TimeoutError:
+                            pass
 
-                    # V22: 等待WS回调触发的即时对冲完成 (最多3秒)
-                    try:
-                        await asyncio.wait_for(
-                            self._instant_hedge_done.wait(), timeout=3.0)
-                    except asyncio.TimeoutError:
-                        self.logger.warning("[HEDGING] 即时对冲超时, 重试")
+                        _total_ms = (time.time() - _t0_open) * 1000
 
-                    _hedge_ok = self._instant_hedge_ok
-                    _x_fill_price = self._instant_hedge_fill_price
-                    _hedge_ms = self._instant_hedge_ms
-
-                    # 即时对冲失败(网络/API异常) → fallback重试
-                    if not _hedge_ok:
-                        ext_bid, ext_ask = self._get_ext_bbo()
-                        _ref = ext_bid if _hedge_side == "sell" else ext_ask
-                        if _ref is None or _ref <= 0:
-                            _ref = _l_price
-
-                        if _side == "sell" and ext_ask and ext_ask > 0:
-                            _cur_spread = float((_l_price - ext_ask) / ext_ask * 10000)
-                        elif _side == "buy" and ext_bid and ext_bid > 0:
-                            _cur_spread = float((ext_bid - _l_price) / _l_price * 10000)
+                        if _filled and self._fill_price and self._fill_price > 0:
+                            _l_actual = self._fill_price
                         else:
-                            _cur_spread = 0
+                            _l_actual = _l_ref
 
-                        self.logger.info(
-                            f"[HEDGING] 即时对冲失败, fallback重试 "
-                            f"ref={_ref} cur_spread={_cur_spread:.1f}bps")
-                        _hedge_start = time.time()
-                        for _retry in range(3):
-                            if self.stop_flag:
-                                break
-                            _x_fill_price = await self._hedge_extended(
-                                _hedge_side, _qty, _ref)
-                            if _x_fill_price is not None:
-                                _hedge_ok = True
-                                break
-                            self.logger.warning(f"[HEDGING] 重试 {_retry+1}/3")
-                            await asyncio.sleep(0.1)
-                            ext_bid, ext_ask = self._get_ext_bbo()
-                            if ext_bid and ext_ask:
-                                _ref = ext_bid if _hedge_side == "sell" else ext_ask
-                        _hedge_ms = (time.time() - _hedge_start) * 1000
-
-                    if _hedge_ok and _x_fill_price:
-                        # BUG-5 fix: 检查追加成交，补充对冲增量
-                        _pending = self._fill_qty_pending
-                        if _pending > 0:
-                            self.logger.info(
-                                f"[HEDGING] 追加成交待补对冲: {_pending}")
-                            ext_bid, ext_ask = self._get_ext_bbo()
-                            _sup_ref = ext_bid if _hedge_side == "sell" else ext_ask
-                            if _sup_ref and _sup_ref > 0:
-                                _sup_price = await self._hedge_extended(
-                                    _hedge_side, _pending, _sup_ref)
-                                if _sup_price:
-                                    _qty = self._fill_qty
-                                    self.logger.info(
-                                        f"[HEDGING] 追加对冲成功: {_hedge_side} {_pending} @ {_sup_price}")
-                                else:
-                                    self.logger.warning(
-                                        f"[HEDGING] 追加对冲失败, 将在对账中修复")
-                            self._fill_qty_pending = Decimal("0")
-
-                        if not self._x_ioc_confirmed.is_set():
-                            try:
-                                await asyncio.wait_for(
-                                    self._x_ioc_confirmed.wait(), timeout=0.5)
-                            except asyncio.TimeoutError:
-                                self.logger.warning(
-                                    "[HEDGING] Extended WS 500ms未确认, 用快照价记账(可能有偏差)")
-                        if self._x_ioc_fill_price and self._x_ioc_fill_price > 0:
-                            _x_fill_price = self._x_ioc_fill_price
-
-                        if _side == "buy":
-                            _spread = float((_x_fill_price - _l_price) / _l_price * 10000)
+                        # 记录开仓 PnL
+                        if _hs_open_side == "buy":
+                            _spread_bps = float((_l_actual - _hs_ref) / _hs_ref * 10000)
                         else:
-                            _spread = float((_l_price - _x_fill_price) / _x_fill_price * 10000)
-                        _fee = float(FEE_EXTENDED_TAKER + FEE_LIGHTER_MAKER) * 10000
-                        _net = _spread - _fee
-                        self.cumulative_net_bps += _net
-                        _dollar = _net / 10000 * float(_qty) * float(_x_fill_price)
+                            _spread_bps = float((_hs_ref - _l_actual) / _l_actual * 10000)
+                        _fee = float(FEE_HOTSTUFF_TAKER + FEE_LIGHTER_MAKER) * 10000
+                        _net_bps = _spread_bps - _fee
+                        self.cumulative_net_bps += _net_bps
+                        _dollar = float(_net_bps / 10000 * float(self.order_size) * float(_hs_ref))
                         self.cumulative_dollar_pnl += _dollar
 
-                        # V35: Feed realized spread to bucketed latency pool
-                        if self._signal_observed_spread > 0:
-                            _s_bkt = self._bucket_spread(self._signal_observed_spread)
-                            _v_bkt = self._bucket_vol(self._signal_vol_bps)
-                            self.latency_pool.record(
-                                _side, self._signal_observed_spread, _spread,
-                                _s_bkt, _v_bkt)
-
+                        self._trade_seq += 1
                         self.logger.info(
-                            f"[成交] L_{_side}@{_l_price} → X_{_hedge_side}@{_x_fill_price}  "
-                            f"spread={_spread:.2f}bps fee={_fee:.2f}bps net={_net:+.2f}bps  "
-                            f"${_dollar:+.4f}  hedge={_hedge_ms:.0f}ms  "
-                            f"decay={self._signal_observed_spread - _spread:.1f}bps  "
+                            f"[开仓完成] HS_{_hs_open_side}@{_hs_ref}  L_{_l_hedge_side}@{_l_actual}  "
+                            f"spread={_spread_bps:.2f}bps fee={_fee:.2f}bps "
+                            f"net={_net_bps:.2f}bps  ${_dollar:+.4f}  "
+                            f"总耗时={_total_ms:.0f}ms  "
                             f"累积=${self.cumulative_dollar_pnl:+.4f}")
 
-                        self._trade_seq += 1
                         self._csv_row([
                             datetime.now(_TZ_CN).isoformat(),
-                            f"v35_open_{self._trade_seq:04d}",
-                            _side,
-                            str(_l_price), str(_x_fill_price), str(_qty),
-                            f"{_spread:.2f}", f"{_fee:.2f}", f"{_net:.2f}",
-                            f"{_hedge_ms:.0f}",
-                            f"{self.cumulative_net_bps:.2f}",
-                            "", "", "", "",
+                            f"hs_l_v36_open_{self._trade_seq:04d}",
+                            f"open_{_hs_open_side}",
+                            str(_l_actual), str(_hs_ref), str(self.order_size),
+                            f"{_spread_bps:.2f}", f"{_fee:.2f}", f"{_net_bps:.2f}",
+                            f"{_total_ms:.0f}", f"{self.cumulative_net_bps:.2f}",
+                            "", f"{self.cumulative_real_pnl:.6f}", "", "",
                             f"{self._signal_observed_spread:.2f}",
                             f"{self._signal_executable_spread:.2f}",
                             f"{self._signal_latency_penalty:.2f}",
                             f"{self._signal_vol_bps:.2f}",
                             f"{self._signal_effective_bps:.2f}",
-                            "open",
+                            self._signal_hedge_mode,
                             self._signal_s_bucket, self._signal_v_bucket,
                             self._signal_d_bucket, self._signal_t_bucket,
                         ])
-                        self._consecutive_hedge_fails = 0
 
-                        # V32: 阶梯升级 — 下一次挂单距离更远
                         if self.ladder_step_bps > 0:
                             self._ladder_level += 1
-                            self.logger.info(
-                                f"[阶梯] 升级到 L{self._ladder_level} "
-                                f"(下次挂单距离={self.open_spread_bps + self._ladder_level * self.ladder_step_bps:.1f}bps)")
+                            self.logger.info(f"[阶梯] 开仓 → L{self._ladder_level}")
 
-                        # V23: 开仓完成后异步快照余额(作为下次平仓的基准)
-                        asyncio.create_task(self._v23_record_pre_trade_balance())
+                        await self._v23_record_pre_trade_balance()
+                        self._reset_cycle()
+                        self.state = State.IDLE
                     else:
-                        self.logger.error("[HEDGING] 对冲失败! 进入修复")
+                        await asyncio.sleep(self.interval)
+
+                # ━━━━━━ STATE: HEDGING (fallback — 如果开仓后Lighter对冲失败) ━━━━━━
+                elif self.state == State.HEDGING:
+                    self.logger.info("[HEDGING] Lighter对冲失败, fallback重试...")
+                    _hedge_side = self._fill_side
+                    _qty = self._fill_qty if self._fill_qty > 0 else self.order_size
+
+                    if _hedge_side is None:
+                        _hedge_side = "sell"
+                    _l_ref = self._l_best_bid if _hedge_side == "sell" else self._l_best_ask
+                    if _l_ref is None or _l_ref <= 0:
+                        self.logger.error("[HEDGING] 无 Lighter BBO, 进入REPAIR")
+                        self.state = State.REPAIR
+                        continue
+
+                    _hedge_ok = False
+                    for _retry in range(3):
+                        if self.stop_flag:
+                            break
+                        _slip_buf = Decimal("0.005")
+                        if _hedge_side == "buy":
+                            _ioc_p = self._round_lighter(_l_ref * (Decimal("1") + _slip_buf))
+                        else:
+                            _ioc_p = self._round_lighter(_l_ref * (Decimal("1") - _slip_buf))
+                        _cid = int(time.time() * 1000) * 10 + 7
+                        await self._lighter_rate_wait()
+                        try:
+                            _, _, _err = await self.lighter_client.create_order(
+                                market_index=self.lighter_market_index,
+                                client_order_index=_cid,
+                                base_amount=int(_qty * self.base_amount_multiplier),
+                                price=int(_ioc_p * self.price_multiplier),
+                                is_ask=(_hedge_side == "sell"),
+                                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                                order_expiry=self.lighter_client.DEFAULT_IOC_EXPIRY,
+                                reduce_only=False,
+                                trigger_price=0,
+                            )
+                            if not _err:
+                                if _hedge_side == "sell":
+                                    self.lighter_position -= _qty
+                                else:
+                                    self.lighter_position += _qty
+                                self.logger.info(f"[HEDGING] Lighter IOC 补单成功: {_hedge_side} {_qty}")
+                                _hedge_ok = True
+                                break
+                            else:
+                                self.logger.warning(f"[HEDGING] 重试 {_retry+1}/3: {_err}")
+                        except Exception as _e:
+                            self.logger.warning(f"[HEDGING] 重试 {_retry+1}/3 异常: {_e}")
+                        await asyncio.sleep(0.2)
+
+                    if not _hedge_ok:
+                        self.logger.error("[HEDGING] 3次重试失败 → REPAIR")
                         self._consecutive_hedge_fails += 1
                         if self._consecutive_hedge_fails >= 3:
                             self._circuit_breaker_until = time.time() + 60
@@ -3364,7 +2626,7 @@ class SpreadArbBot:
                         self.state = State.REPAIR
                         continue
 
-                    await self._cancel_all_lighter()
+                    self._consecutive_hedge_fails = 0
                     self._reset_cycle()
                     self.state = State.IDLE
 
@@ -3373,10 +2635,10 @@ class SpreadArbBot:
                     self.logger.info("[REPAIR] 对账并修复...")
                     await self._cancel_all_lighter()
                     await self._reconcile()
-                    if abs(self.lighter_position + self.extended_position) > self.order_size * Decimal("0.5"):
+                    if abs(self.lighter_position + self.hotstuff_position) > self.order_size * Decimal("0.5"):
                         await self._emergency_flatten()
                     # ISSUE-9 fix: 修复后检查净敞口，未归零则冷却 30 秒
-                    _net_after_repair = abs(self.lighter_position + self.extended_position)
+                    _net_after_repair = abs(self.lighter_position + self.hotstuff_position)
                     if _net_after_repair >= self.order_size * Decimal("0.5"):
                         self.logger.error(
                             f"[REPAIR] 修复后仍有净敞口={_net_after_repair}, 冷却30秒")
@@ -3406,8 +2668,8 @@ class SpreadArbBot:
         self._l_buy_order_idx = None
         self._l_sell_order_idx = None
         # V22 reset
-        self._fill_ext_bid = None
-        self._fill_ext_ask = None
+        self._fill_hs_bid = None
+        self._fill_hs_ask = None
         self._fill_ts = 0.0
         if self._instant_hedge_task and not self._instant_hedge_task.done():
             self._instant_hedge_task.cancel()
@@ -3436,67 +2698,47 @@ class SpreadArbBot:
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    p = argparse.ArgumentParser(description="V35 分桶延迟学习 (spread x vol bucketed latency + 多级回退)")
+    p = argparse.ArgumentParser(
+        description="HotStuff+Lighter V36: 双Taker套利 (HS IOC开仓 + L IOC对冲, L1深度检查)")
     p.add_argument("-s", "--symbol", default="BTC")
-    p.add_argument("--size", type=str, default="0.001")
-    p.add_argument("--max-position", type=str, default="0.01")
-    p.add_argument("--open-spread", type=float, default=4.5,
-                   help="基础开仓价差bps: 动态阈值的下限参考 (默认4.5)")
-    p.add_argument("--close-spread", type=float, default=-0.5,
-                   help="平仓价差阈值bps: 价差收敛到此值时平仓 (默认-0.5)")
-    p.add_argument("--max-order-age", type=float, default=30.0,
-                   help="最大挂单存活秒数 (默认30)")
-    p.add_argument("--spread-buffer", type=float, default=0.0,
-                   help="内部价差缓冲bps: 补偿延迟滑点 (默认0)")
-    p.add_argument("--ladder-step", type=float, default=0.3,
-                   help="阶梯间距bps: 每层开仓间隔 (默认0.3)")
-    p.add_argument("--close-deep", type=float, default=-0.3,
-                   help="深度平仓阈值bps: 等待后如果basis达到此值则平剩余 (默认-0.3)")
-    p.add_argument("--close-wait", type=float, default=2.0,
-                   help="快速平仓后等待秒数: 观察价差是否继续收敛 (默认2.0)")
-    p.add_argument("--open-jit-wait", type=float, default=1.5,
-                   help="开仓JIT等待秒数 (默认1.5)")
-    p.add_argument("--close-jit-wait", type=float, default=1.0,
-                   help="平仓JIT等待秒数 (默认1.0)")
-    p.add_argument("--open-jit-price", type=str, default="at_best",
-                   choices=["at_best", "improve", "behind"],
-                   help="开仓JIT定价模式 (默认at_best)")
-    p.add_argument("--close-jit-price", type=str, default="improve",
-                   choices=["at_best", "improve", "behind"],
-                   help="平仓JIT定价模式 (默认improve)")
+    p.add_argument("--size", type=str, default="0.005")
+    p.add_argument("--max-position", type=str, default="0.02")
+    p.add_argument("--open-spread", type=float, default=3.5,
+                   help="基础开仓价差bps: 动态阈值的下限参考 (默认3.5)")
+    p.add_argument("--close-spread", type=float, default=0.0,
+                   help="平仓价差阈值bps: 价差收敛到此值时平仓 (默认0)")
+    p.add_argument("--max-order-age", type=float, default=30.0)
+    p.add_argument("--spread-buffer", type=float, default=0.0)
+    p.add_argument("--ladder-step", type=float, default=0.4,
+                   help="阶梯间距bps: 每层开仓间隔 (默认0.4)")
+    p.add_argument("--close-deep", type=float, default=-0.3)
+    p.add_argument("--close-wait", type=float, default=2.0)
     p.add_argument("--hedge-timeout", type=float, default=5.0)
     p.add_argument("--interval", type=float, default=0.05)
     p.add_argument("--flatten-on-start", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--env-file", default=".env")
-    # V34 new params
-    p.add_argument("--vol-weight", type=float, default=0.5,
-                   help="V35.1: 波动惩罚权重: vol_cost = weight * ewma_vol (默认0.5)")
-    p.add_argument("--inv-weight", type=float, default=1.0,
-                   help="库存惩罚权重: inv_cost = weight * (pos/max) * 2bps (默认1.0)")
-    p.add_argument("--persist-count", type=int, default=3,
-                   help="持续性过滤: 连续N次采样超阈值才开仓 (默认3)")
-    p.add_argument("--persist-ms", type=float, default=200.0,
-                   help="持续性过滤: 或持续T毫秒 (默认200)")
-    p.add_argument("--latency-cold", type=float, default=0.8,
-                   help="冷启动延迟惩罚bps: 影子学习热启动前使用此值 (默认0.8)")
-    p.add_argument("--close-passive-edge", type=float, default=3.0,
-                   help="分级平仓: 残余edge>此值用Passive Maker (默认3.0bps)")
-    p.add_argument("--close-aggressive-edge", type=float, default=1.5,
-                   help="分级平仓: 残余edge>此值用Aggressive Limit (默认1.5bps)")
-    # V35.1 entry economics params
-    p.add_argument("--expected-close-cost", type=float, default=0.8,
-                   help="V35.1: 期望平仓成本bps (替代fee*2+close_target, 默认0.8)")
-    p.add_argument("--latency-cap", type=float, default=1.5,
-                   help="V35.1: 延迟学习上限bps (防异常值抬死门槛, 默认1.5)")
-    p.add_argument("--edge-buffer", type=float, default=0.5,
-                   help="V35.1: 最低安全利润缓冲bps (默认0.5)")
-    # V35.2 close depth params
-    p.add_argument("--close-depth-levels", type=int, default=2,
-                   help="V35.2: 平仓深度检查档数 (1=仅L1, 2=L1+L2, 默认2)")
+    p.add_argument("--vol-weight", type=float, default=0.5)
+    p.add_argument("--inv-weight", type=float, default=1.0)
+    p.add_argument("--persist-count", type=int, default=3)
+    p.add_argument("--persist-ms", type=float, default=200.0)
+    p.add_argument("--latency-cold", type=float, default=0.8)
+    p.add_argument("--expected-close-cost", type=float, default=0.8)
+    p.add_argument("--latency-cap", type=float, default=1.5)
+    p.add_argument("--edge-buffer", type=float, default=0.5)
+    p.add_argument("--close-depth-levels", type=int, default=1,
+                   help="平仓Lighter深度检查档数 (默认1=仅L1)")
+    p.add_argument("--open-depth-levels", type=int, default=1,
+                   help="开仓Lighter深度检查档数 (默认1=仅L1)")
     args = p.parse_args()
 
     load_dotenv(args.env_file)
+
+    # ── 进程锁: 防止同一 symbol 双实例 ──
+    _pid_lock = PidLock(args.symbol.upper())
+    if not _pid_lock.acquire():
+        sys.exit(1)
+    atexit.register(_pid_lock.release)
 
     bot = SpreadArbBot(
         symbol=args.symbol.upper(),
@@ -3512,37 +2754,32 @@ def main():
         ladder_step_bps=args.ladder_step,
         close_deep_bps=args.close_deep,
         close_wait_sec=args.close_wait,
-        open_jit_wait=args.open_jit_wait,
-        close_jit_wait=args.close_jit_wait,
-        open_jit_price_mode=args.open_jit_price,
-        close_jit_price_mode=args.close_jit_price,
         vol_weight=args.vol_weight,
         inv_weight=args.inv_weight,
         persist_count=args.persist_count,
         persist_ms=args.persist_ms,
         latency_cold=args.latency_cold,
-        close_passive_edge=args.close_passive_edge,
-        close_aggressive_edge=args.close_aggressive_edge,
         expected_close_cost=args.expected_close_cost,
         latency_cap=args.latency_cap,
         edge_buffer=args.edge_buffer,
         close_depth_levels=args.close_depth_levels,
+        open_depth_levels=args.open_depth_levels,
     )
     bot.flatten_on_start = args.flatten_on_start
 
-    fee_per = float(FEE_EXTENDED_TAKER) * 10000
-    print(f"[V35.2] 单层分仓+深度加权平仓优化 (single-layer close + depth check)")
+    fee_per = float(FEE_HOTSTUFF_TAKER) * 10000
+    print(f"[V36] Taker开仓 + 双向深度加权 (IOC taker open + depth check)")
     print(f"  {args.symbol} size={args.size} max_pos={args.max_position}")
+    print(f"  开仓: Taker IOC + L1-L{args.open_depth_levels}深度检查 (无JIT等待)")
     print(f"  阈值 = max(open_spread({args.open_spread}), "
-          f"open_fee({fee_per:.2f}) + exp_close({args.expected_close_cost}) "
-          f"+ min(latency,{args.latency_cap}) + slip + vol*{args.vol_weight} + edge({args.edge_buffer}))")
+          f"fee({fee_per:.2f}) + ec({args.expected_close_cost}) "
+          f"+ min(lat,{args.latency_cap}) + slip + vol*{args.vol_weight} + edge({args.edge_buffer}))")
     print(f"  持续性过滤: {args.persist_count}次/{args.persist_ms}ms")
-    print(f"  平仓: basis≤{args.close_spread} → 单层({args.size}) + L1-L{args.close_depth_levels}深度检查"
-          f" → 分级(passive>{args.close_passive_edge}/agg>{args.close_aggressive_edge}/fast/emergency)")
+    print(f"  平仓: basis≤{args.close_spread} → 单层({args.size}) + L1-L{args.close_depth_levels}深度检查 → Taker IOC")
     step_info = f"  阶梯间距={args.ladder_step}bps" if args.ladder_step > 0 else "  阶梯=关闭"
     print(step_info)
     print(f"  延迟冷启动={args.latency_cold}bps → 影子学习~6秒自动热启动  inv_w={args.inv_weight}")
-    print(f"  V35分桶: spread(S1<2/S2<4/S3≥4) x vol(V1<0.15/V2<0.5/V3≥0.5) → 三级回退")
+    print(f"  V36改进: Maker→Taker开仓(200ms<300ms+1.5s), 0%taker费, 消除JIT衰减")
 
     if uvloop is not None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
